@@ -644,6 +644,50 @@ function createChartContainer(data, canvasId, type) {
 
     container.appendChild(contentSection);
 
+    // Add simple flamegraph links below the chart: left label, inline orange links
+    (function addFlamegraphLinks() {
+        try {
+            const flamegraphs = getFlameGraphsForBenchmark(data.label, activeRuns || new Set());
+            if (!flamegraphs || flamegraphs.length === 0) return;
+
+            const outer = document.createElement('div');
+            outer.className = 'chart-flamegraph-links';
+
+            const label = document.createElement('div');
+            label.className = 'flamegraph-label';
+            label.textContent = 'Flamegraph(s):';
+
+            const links = document.createElement('div');
+            links.className = 'flamegraph-links-inline';
+
+            flamegraphs.forEach(fg => {
+                const a = document.createElement('a');
+                a.className = 'flamegraph-link';
+                a.href = fg.path;
+                a.target = '_blank';
+
+                // flame emoticon before run name
+                const icon = document.createElement('span');
+                icon.className = 'flame-icon';
+                icon.textContent = '🔥';
+
+                const text = document.createElement('span');
+                text.className = 'flame-text';
+                text.textContent = fg.runName ? `${fg.runName}${fg.timestamp ? ' — ' + fg.timestamp : ''}` : (fg.timestamp || 'Flamegraph');
+
+                a.appendChild(icon);
+                a.appendChild(text);
+                links.appendChild(a);
+            });
+
+            outer.appendChild(label);
+            outer.appendChild(links);
+            container.appendChild(outer);
+        } catch (e) {
+            console.error('Error while adding flamegraph links for', data.label, e);
+        }
+    })();
+
     // Create footer section for details
     const footerSection = document.createElement('div');
     footerSection.className = 'chart-footer';
@@ -1550,6 +1594,9 @@ function toggleAllTags(select) {
 
 function initializeCharts() {
     console.log('initializeCharts() started');
+    console.log('loadedBenchmarkRuns:', loadedBenchmarkRuns.length, 'runs');
+    console.log('First run name:', loadedBenchmarkRuns.length > 0 ? loadedBenchmarkRuns[0].name : 'no runs');
+    console.log('defaultCompareNames:', defaultCompareNames);
     
     // Process raw data
     console.log('Processing timeseries data...');
@@ -1565,11 +1612,13 @@ function initializeCharts() {
     console.log('Layer comparisons data processed:', layerComparisonsData.length, 'items');
     
     allRunNames = [...new Set(loadedBenchmarkRuns.map(run => run.name))];
+    console.log('All run names:', allRunNames);
     
     // In flamegraph-only mode, ensure we include runs from flamegraph data
     if (validateFlameGraphData()) {
         const flamegraphRunNames = Object.keys(window.flamegraphData.runs);
         allRunNames = [...new Set([...allRunNames, ...flamegraphRunNames])];
+        console.log('Added flamegraph runs, total run names:', allRunNames);
     }
     
     latestRunsLookup = createLatestRunsLookup();
@@ -1725,15 +1774,37 @@ function fetchAndProcessData(url, isArchived = false) {
             return response.json();
         })
         .then(data => {
-            const newRuns = data.runs || data;
+            // Enforce new canonical format: data MUST have runs(array), metadata(object), tags(object)
+            if (!data || !Array.isArray(data.runs)) {
+                throw new Error('Invalid data format: expected object with array "runs"');
+            }
 
             if (isArchived) {
-                // Merge with existing data for archived data
-                loadedBenchmarkRuns = loadedBenchmarkRuns.concat(newRuns);
+                loadedBenchmarkRuns = loadedBenchmarkRuns.concat(data.runs);
                 archivedDataLoaded = true;
             } else {
-                // Replace existing data for current data
-                loadedBenchmarkRuns = newRuns;
+                loadedBenchmarkRuns = data.runs;
+                window.benchmarkMetadata = data.metadata || {};
+                window.benchmarkTags = data.tags || {};
+
+                // Only accept "flamegraphData" key now
+                if (data.flamegraphData && data.flamegraphData.runs) {
+                    window.flamegraphData = data.flamegraphData;
+                    console.log('Flamegraph data loaded with', Object.keys(data.flamegraphData.runs).length, 'runs');
+                } else {
+                    window.flamegraphData = { runs: {} };
+                }
+
+                if (Array.isArray(data.defaultCompareNames)) {
+                    console.log('Using defaultCompareNames from remote data:', data.defaultCompareNames);
+                }
+
+                console.log('Remote data loaded (canonical format):', {
+                    runs: data.runs.length,
+                    metadata: Object.keys(window.benchmarkMetadata).length,
+                    tags: Object.keys(window.benchmarkTags).length,
+                    flamegraphs: Object.keys(window.flamegraphData.runs).length
+                });
             }
             initializeCharts();
         })
@@ -1755,32 +1826,25 @@ function loadData() {
     if (typeof remoteDataUrl !== 'undefined' && remoteDataUrl !== '') {
         console.log('Using remote data URL:', remoteDataUrl);
         // Fetch data from remote URL
-        const url = remoteDataUrl.endsWith('/') ? remoteDataUrl + 'data.json' : remoteDataUrl + '/data.json';
-        fetchAndProcessData(url);
+        fetchAndProcessData(remoteDataUrl);
     } else {
         console.log('Using local data');
-        // Use local data
-        console.log('benchmarkRuns available:', typeof benchmarkRuns, Array.isArray(benchmarkRuns) ? benchmarkRuns.length : 'not array');
-        loadedBenchmarkRuns = benchmarkRuns;
-        // Assign global metadata from data.js if window.benchmarkMetadata is not set
-        if (!window.benchmarkMetadata) {
-            window.benchmarkMetadata = (typeof benchmarkMetadata !== 'undefined') ? benchmarkMetadata : {};
-        }
-        console.log('benchmarkMetadata loaded:', Object.keys(window.benchmarkMetadata).length, 'items');
-        // Assign global tags from data.js if window.benchmarkTags is not set
-        if (!window.benchmarkTags) {
-            window.benchmarkTags = (typeof benchmarkTags !== 'undefined') ? benchmarkTags : {};
-        }
-        console.log('benchmarkTags loaded:', Object.keys(window.benchmarkTags).length, 'items');
-        // Assign flamegraph data from data.js if available
-        if (typeof flamegraphData !== 'undefined') {
-            window.flamegraphData = flamegraphData;
-            console.log('Loaded flamegraph data from data.js with', Object.keys(flamegraphData.runs || {}).length, 'runs');
+        // Use local data in canonical packaged form: expect benchmarkRuns + benchmarkMetadata + benchmarkTags + defaultCompareNames + optional flamegraphData
+        if (!Array.isArray(benchmarkRuns)) {
+            console.error('Local data error: benchmarkRuns must be an array in canonical format');
+            loadedBenchmarkRuns = [];
         } else {
-            window.flamegraphData = { runs: {} };
-            console.log('No flamegraph data available');
+            loadedBenchmarkRuns = benchmarkRuns;
         }
-        console.log('defaultCompareNames available:', typeof defaultCompareNames, Array.isArray(defaultCompareNames) ? defaultCompareNames : 'not defined');
+        window.benchmarkMetadata = (typeof benchmarkMetadata === 'object') ? benchmarkMetadata : {};
+        window.benchmarkTags = (typeof benchmarkTags === 'object') ? benchmarkTags : {};
+        window.flamegraphData = (typeof flamegraphData === 'object' && flamegraphData?.runs) ? flamegraphData : { runs: {} };
+        console.log('Local data loaded (canonical format):', {
+            runs: loadedBenchmarkRuns.length,
+            metadata: Object.keys(window.benchmarkMetadata).length,
+            tags: Object.keys(window.benchmarkTags).length,
+            flamegraphs: Object.keys(window.flamegraphData.runs).length
+        });
         initializeCharts();
         loadingIndicator.classList.add('hidden'); // Hide loading indicator
         console.log('=== loadData() completed ===');
