@@ -66,8 +66,8 @@ def do_configure(args):
     cmake_export_compile_commands = 'OFF'
     verbose = 'OFF'
 
-    if sys.platform != "darwin":
-        sycl_enabled_plugins.append("level_zero")
+    # if sys.platform != "darwin":
+    #     sycl_enabled_plugins.append("level_zero")
 
     # lld is needed on Windows or for the HIP plugin on AMD
     if platform.system() == 'Windows' or (args.hip and args.hip_platform == 'AMD'):
@@ -215,13 +215,13 @@ def do_configure(args):
         "-DCGEIST_DEFAULT_ALLOW_UNDEFINED_SYCL_TYPES={}".format(cgeist_allow_undefined_sycl_types),
     ]
 
-    if args.l0_headers and args.l0_loader:
-      cmake_cmd.extend([
-            "-DLEVEL_ZERO_INCLUDE_DIR={}".format(args.l0_headers),
-            "-DLEVEL_ZERO_LIBRARY={}".format(args.l0_loader)])
-    elif args.l0_headers or args.l0_loader:
-      sys.exit("Please specify both Level Zero headers and loader or don't specify "
-               "none of them to let download from github.com")
+    # if args.l0_headers and args.l0_loader:
+    #   cmake_cmd.extend([
+    #         "-DLEVEL_ZERO_INCLUDE_DIR={}".format(args.l0_headers),
+    #         "-DLEVEL_ZERO_LIBRARY={}".format(args.l0_loader)])
+    # elif args.l0_headers or args.l0_loader:
+    #   sys.exit("Please specify both Level Zero headers and loader or don't specify "
+    #            "none of them to let download from github.com")
 
     # Add additional CMake options if provided
     if args.cmake_opt:
