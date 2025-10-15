@@ -30,6 +30,7 @@ enum InlineMode { AlwaysInline, Simple, Aggressive, Ludicrous };
 // Passes
 //===----------------------------------------------------------------------===//
 
+std::unique_ptr<Pass> createToyPass();
 std::unique_ptr<Pass> createConstantPropagationPass(
     const ConstantPropagationPassOptions &options = {});
 std::unique_ptr<Pass> createInlinePass();

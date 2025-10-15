@@ -11,6 +11,16 @@
 
 include "mlir/Pass/PassBase.td"
 
+def ToyPass
+    : Pass<"sycl-toy", "::mlir::ModuleOp"> {
+  let summary = "SYCL toy pass";
+  let description = [{
+    A toy pass.
+  }];
+  let constructor = "mlir::sycl::createToyPass()";
+  let dependentDialects = ["arith::ArithDialect"];
+}
+
 def ConstantPropagationPass
     : Pass<"sycl-constant-propagation", "::mlir::ModuleOp"> {
   let summary = "SYCL host-device constant propagation";
