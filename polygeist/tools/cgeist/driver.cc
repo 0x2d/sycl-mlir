@@ -899,18 +899,22 @@ static LogicalResult createAndExecutePassPipeline(
     mlir::MLIRContext &Ctx, mlir::OwningOpRef<mlir::ModuleOp> &Module,
     llvm::DataLayout &DL, llvm::Triple &Triple, Options &options,
     bool SYCLRaiseHost, bool &LinkOMP) {
+
+  // llvm::dbgs() << "*** Before canonicalize. ***\n";
+  // Module->dump();
+
   // MLIR canonicalization & cleanup.
   if (mlir::failed(canonicalize(Ctx, Module, options, SYCLRaiseHost)))
     return failure();
 
   // MLIR optimizations.
-  // llvm::dbgs() << "*** Optimize started. ***\n";
+  // llvm::dbgs() << "*** Before optimize. ***\n";
   // Module->dump();
 
   if (mlir::failed(optimize(Ctx, Module, options, SYCLRaiseHost)))
     return failure();
 
-  // llvm::dbgs() << "*** Optimize finished. ***\n";
+  // llvm::dbgs() << "*** Before finalize. ***\n";
   // Module->dump();
 
   // CUDA specific MLIR optimizations.
