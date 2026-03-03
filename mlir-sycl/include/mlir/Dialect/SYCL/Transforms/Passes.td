@@ -11,13 +11,13 @@
 
 include "mlir/Pass/PassBase.td"
 
-def ToyPass
-    : Pass<"sycl-toy", "::mlir::ModuleOp"> {
-  let summary = "SYCL toy pass";
+def FusionPass
+    : Pass<"sycl-fusion", "::mlir::ModuleOp"> {
+  let summary = "SYCL fusion pass";
   let description = [{
-    A toy pass.
+    Perform kernel fusion.
   }];
-  let constructor = "mlir::sycl::createToyPass()";
+  let constructor = "mlir::sycl::createFusionPass()";
   let dependentDialects = ["arith::ArithDialect"];
 }
 

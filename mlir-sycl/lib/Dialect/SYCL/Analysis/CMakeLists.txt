@@ -1,5 +1,6 @@
 add_mlir_dialect_library(MLIRSYCLAnalysis
   AliasAnalysis.cpp
+  KernelAnalysis.cpp
   SYCLIDAndRangeAnalysis.cpp
   SYCLAccessorAnalysis.cpp
   SYCLBufferAnalysis.cpp

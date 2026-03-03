@@ -1,5 +1,6 @@
 add_mlir_library(MLIRSYCLTransforms
-  ToyPass.cpp
+  RegisterPromotionPattern.cpp
+  FusionPass.cpp
   ConstantPropagation.cpp
   Inliner.cpp
 

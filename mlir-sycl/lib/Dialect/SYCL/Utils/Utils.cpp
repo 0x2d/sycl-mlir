@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SYCL/Utils/Utils.h"
 
 using namespace mlir;
@@ -89,4 +91,78 @@ void sycl::populateLocalID(SmallVectorImpl<Value> &localIDs, unsigned numDims,
   Type resTy = builder.getIndexType();
   for (unsigned dim = 0; dim < numDims; ++dim)
     localIDs.push_back(sycl::createSYCLIDGetOp(resTy, id, dim, builder, loc));
+}
+
+LogicalResult sycl::checkEquivalent(Value lhs, Value rhs) {
+  if (lhs == rhs) {
+    // Identical values
+    return success();
+  } else {
+    // Else check their define ops
+    if (llvm::isa<mlir::BlockArgument>(lhs)) {
+      // No define ops
+      return failure();
+    } else {
+      // Have define ops
+      Operation *def1 = lhs.getDefiningOp();
+      Operation *def2 = rhs.getDefiningOp();
+      if (def1->getName() != def2->getName() ||
+          def1->getAttrs() != def2->getAttrs() ||
+          def1->getPropertiesStorage() != def2->getPropertiesStorage()) {
+        // Different op types
+        return failure();
+      }
+      // Check equivalent of values
+      unsigned int def1NumOperands = def1->getNumOperands();
+      unsigned int def2NumOperands = def2->getNumOperands();
+      if (def1NumOperands != def2NumOperands) {
+        // Different operand number
+        return failure();
+      }
+      for (int i = 0; i < def1NumOperands; i++) {
+        if (failed(checkEquivalent(def1->getOperand(i), def2->getOperand(i)))) {
+          return failure();
+        }
+      }
+      return success();
+    }
+  }
+}
+
+Value sycl::getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op) {
+  // Information of current load op
+  Value curAcc = op.getAcc();
+  Value curIndex = op.getIndex();
+
+  // Get load address
+  Value memLoc1 = llvm::dyn_cast<memref::CastOp>(curIndex.getDefiningOp()).getSource();
+  Value memId1;
+  for (auto user: memLoc1.getUsers()) {
+    if (auto storeUser = llvm::dyn_cast<affine::AffineStoreOp>(user)) {
+      memId1 = storeUser.getValue();
+      break;
+    }
+  }
+  Value memLoc2 = llvm::dyn_cast<affine::AffineLoadOp>(memId1.getDefiningOp()).getMemref();
+  Value memCast2;
+  for (auto user: memLoc2.getUsers()) {
+    if (auto castUser = llvm::dyn_cast<memref::CastOp>(user)) {
+      for (auto userInner: castUser.getDest().getUsers()) {
+        if (auto castUserInner = llvm::dyn_cast<memref::MemorySpaceCastOp>(userInner)) {
+          memCast2 = castUserInner.getDest();
+          break;
+        }
+      }
+      break;
+    }
+  }
+  Value offset;
+  for (auto user: memCast2.getUsers()) {
+    if (auto idUser = llvm::dyn_cast<sycl::SYCLConstructorOp>(user)) {
+      auto idArgs = idUser.getArgs();
+      offset = idArgs[0];
+      break;
+    }
+  }
+  return offset;
 }

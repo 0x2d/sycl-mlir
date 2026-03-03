@@ -502,9 +502,12 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
     OptPM.addPass(polygeist::createReplaceAffineCFGPass());
     PM.addPass(sycl::createInlinePass({sycl::InlineMode::Simple,
                                        /* RemoveDeadCallees */ true}));
-    PM.addPass(sycl::createToyPass());
+    
+    PM.addPass(sycl::createFusionPass());
+    PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+    PM.addPass(mlir::createCSEPass());
   }
-
+ 
   if (PrintPipeline) {
     llvm::errs() << "Optimization pipeline:\n";
     PM.dump();
@@ -905,14 +908,8 @@ static LogicalResult createAndExecutePassPipeline(
     return failure();
 
   // MLIR optimizations.
-  // llvm::dbgs() << "*** Before optimize. ***\n";
-  // Module->dump();
-
   if (mlir::failed(optimize(Ctx, Module, options, SYCLRaiseHost)))
     return failure();
-
-  // llvm::dbgs() << "*** After optimize. ***\n";
-  // Module->dump();
 
   // CUDA specific MLIR optimizations.
   if (mlir::failed(optimizeCUDA(Ctx, Module, options, SYCLRaiseHost)))

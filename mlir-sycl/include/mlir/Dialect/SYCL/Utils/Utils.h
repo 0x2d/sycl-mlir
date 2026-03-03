@@ -62,6 +62,11 @@ void populateWorkGroupSize(SmallVectorImpl<Value> &wgSizes, unsigned numDims,
 void populateLocalID(SmallVectorImpl<Value> &localIDs, unsigned numDims,
                      OpBuilder builder, Location loc);
 
+// Check equivalent of two values
+LogicalResult checkEquivalent(Value lhs, Value rhs);
+
+Value getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op);
+
 } // namespace sycl
 } // namespace mlir
 
