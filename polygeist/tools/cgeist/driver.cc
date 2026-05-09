@@ -1192,6 +1192,12 @@ void Options::splitCommandLineOptions(int argc, char **argv) {
     } else if (Ref == "--args") {
       ClangOption = true;
       MLIROpts.push_back(argv[I]);
+    } else if (Ref == "-aux-target-feature" || Ref == "-target-feature" ||
+               Ref == "-aux-target-cpu" || Ref == "-target-cpu") {
+      // These cc1 options take a separate value argument (e.g. "+lzcnt").
+      // Skip both the flag and its value to avoid misinterpreting the value
+      // as an input file.
+      I++;
     } else if (Ref.consume_front("-O") || Ref.consume_front("--optimize")) {
       // If several flags are passed, we keep the last one.
       llvm::OptimizationLevel OptLevel = ExitOnErr(parseOptimizationLevel(Ref));
