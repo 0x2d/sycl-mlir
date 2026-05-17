@@ -14,11 +14,14 @@ The project uses CMake via buildbot scripts:
 # Configure
 python buildbot/configure.py -o build
 
-# Build (default target: sycl-toolchain)
+# Build (default target: deploy-sycl-toolchain)
 python buildbot/compile.py -o build -j<threads>
 
 # Build specific targets
 python buildbot/compile.py -o build -t clang -j8
+
+# Or drive ninja directly once configured
+ninja -C build cgeist polygeist-opt mlir-opt
 ```
 
 Available configure flags:
@@ -26,10 +29,12 @@ Available configure flags:
 - `--cuda` - Enable CUDA backend
 - `--hip` - Enable HIP backend
 - `--shared-libs` - Build shared libraries
+- `--cgeist-allow-undefined-sycl-types` - Let cgeist accept undefined SYCL types by default (useful when iterating on Polygeist front-end work)
+- `--enable-all-llvm-targets` - Build NVPTX and AMDGPU targets in addition to the host
 - `-t {Debug|Release}` - Build type
 - `-o <path>` - Build directory
 
-The build uses Ninja by default. Existing build directory is at `build/`.
+The build uses Ninja by default. Existing build directory is at `build/`. Built tools land in `build/bin/` — the ones used most for MLIR-SYCL work are `cgeist`, `polygeist-opt`, `mlir-opt`, `mlir-translate`, `clang`, and `llvm-spirv`.
 
 ## Key Directories
 
@@ -56,21 +61,34 @@ The SYCL compilation flow:
 
 Key MLIR-SYCL components:
 - `mlir-sycl/lib/Dialect/SYCL/` - SYCL dialect definition
-- `mlir-sycl/lib/Conversion/` - Lowering passes (SYCLToLLVM, SYCLToSPIRV, SYCLToGPU, SYCLToMath)
-- `polygeist/tools/cgeist/` - C to MLIR driver
+- `mlir-sycl/lib/Conversion/` - Lowering passes (`SYCLToLLVM`, `SYCLToSPIRV`, `SYCLToGPU`, `SYCLToMath`)
+- `mlir-sycl/lib/Transforms/` and `mlir-sycl/lib/Analysis/` - dialect-level transforms and analyses
+- `mlir-sycl/test/{Dialect,Conversion,Transforms,Analysis}/` - lit tests, organized to mirror `lib/`
+- `polygeist/tools/cgeist/` - C/C++ → MLIR driver (`cgeist`)
+- `polygeist/tools/polygeist-opt/` - opt-style driver for Polygeist + SYCL dialects
 
 ## Testing
 
 ### In-tree LIT tests
 ```bash
-# Run SYCL tests
+# SYCL runtime / headers
 ninja -C build check-sycl
 
-# Run specific component
-ninja -C build check-llvm-spirv
+# MLIR-SYCL dialect, conversions, transforms
+ninja -C build check-mlir-sycl
 
-# Run clang tests
+# Polygeist (cgeist + polygeist-opt regression suites)
+ninja -C build check-cgeist
+ninja -C build check-polygeist
+
+# Other components
+ninja -C build check-llvm-spirv
 ninja -C build check-clang
+```
+
+Run a single lit test by invoking `llvm-lit` directly against the file:
+```bash
+build/bin/llvm-lit -v mlir-sycl/test/Conversion/SYCLToLLVM/some_test.mlir
 ```
 
 ### E2E tests
