@@ -731,6 +731,20 @@ ValueCategory MLIRScanner::VisitLambdaExpr(clang::LambdaExpr *Expr) {
             Val);
       }
 
+      // The closure field that holds the captured reference may live in a
+      // different address space than the captured variable's storage (e.g.
+      // a stack-allocated `int i` is in addrspace 0 but a SYCL device-side
+      // closure field is in addrspace 4). Bring the source pointer/memref
+      // into the field's address space before storing, otherwise
+      // ValueCategory::store cannot match the types and silently emits no
+      // store, leaving the field uninitialized.
+      if (Field) {
+        mlir::Type FieldTy = Glob.getTypes().getMLIRType(Field->getType());
+        if (isa<MemRefType, LLVM::LLVMPointerType>(FieldTy) &&
+            isa<MemRefType, LLVM::LLVMPointerType>(Val.getType()))
+          Val = castToMemSpaceOfType(Val, FieldTy);
+      }
+
       CommonFieldLookup(
           Expr->getCallOperator()->getFunctionObjectParameterType(), Field, Op,
           ElemTy,

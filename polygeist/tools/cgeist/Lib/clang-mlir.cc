@@ -103,7 +103,24 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
                             ? &Function.getBlocks().front()
                             : Function.addEntryBlock());
 
+  const clang::CodeGen::CGFunctionInfo &FI = Glob.getOrCreateCGFunctionInfo(FD);
+  IsSRet =
+      (FI.getReturnInfo().getKind() == clang::CodeGen::ABIArgInfo::Indirect);
+  unsigned SRetArgNo = ~0U;
+  if (IsSRet) {
+    mlirclang::CodeGen::ClangToLLVMArgMapping Mapping(
+        Glob.getCGM().getContext(), FI, /*OnlyRequiredArgs=*/true);
+    SRetArgNo = Mapping.getSRetArgNo();
+    SRetArg = Function.getArgument(SRetArgNo);
+  }
+
   unsigned I = 0;
+  unsigned IRIdx = 0;
+  auto MaybeSkipSRet = [&]() {
+    if (IsSRet && IRIdx == SRetArgNo)
+      ++IRIdx;
+  };
+  MaybeSkipSRet();
   if (const auto *CM = dyn_cast<clang::CXXMethodDecl>(FD)) {
     if (CM->getParent()->isLambda()) {
       for (auto C : CM->getParent()->captures()) {
@@ -119,15 +136,16 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
     }
 
     if (CM->isInstance()) {
-      Value Val = Function.getArgument(I);
+      Value Val = Function.getArgument(IRIdx);
       ThisVal = ValueCategory(
           Val, /*isReference*/ false,
           Glob.getTypes().getMLIRType(CM->getFunctionObjectParameterType()));
       I++;
+      ++IRIdx;
+      MaybeSkipSRet();
     }
   }
 
-  const clang::CodeGen::CGFunctionInfo &FI = Glob.getOrCreateCGFunctionInfo(FD);
   auto FIArgs = FI.arguments();
 
   for (clang::ParmVarDecl *Parm : FD->parameters()) {
@@ -153,7 +171,7 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
          FIArgs[I].info.getKind() ==
              clang::CodeGen::ABIArgInfo::IndirectAliased);
 
-    Value Val = Function.getArgument(I);
+    Value Val = Function.getArgument(IRIdx);
     assert(Val && "Expecting a valid value");
 
     if (IsReference) {
@@ -184,6 +202,8 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
     }
 
     I++;
+    ++IRIdx;
+    MaybeSkipSRet();
   }
 
   if (FD->hasAttr<clang::CUDAGlobalAttr>() &&

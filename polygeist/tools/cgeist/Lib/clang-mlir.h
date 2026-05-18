@@ -270,6 +270,8 @@ private:
   std::vector<mlir::Value> ArrayInit;
   ValueCategory ThisVal;
   mlir::Value ReturnVal;
+  mlir::Value SRetArg;
+  bool IsSRet = false;
   LowerToInfo &LTInfo;
 
   // Get the \p FNum field of MemRef Value \p V of element type T. \p Shape is

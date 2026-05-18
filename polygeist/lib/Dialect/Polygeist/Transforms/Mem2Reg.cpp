@@ -1868,9 +1868,13 @@ bool isPromotable(mlir::Value AI) {
                                   << " because of volatile store " << SO);
           return false;
         }
-        if (AI == SO.getValue()) {
+        // If the alloca (or a cast thereof) is being stored as the *value*
+        // (not the address operand), its address has escaped — promotion to
+        // SSA would lose the writes that happen through the captured pointer.
+        if (val == SO.getValue()) {
           LLVM_DEBUG(llvm::dbgs() << "cannot promote " << AI
                                   << " because it is captured in " << SO);
+          return false;
         }
         if (SO.getValue().getType() != elemType) {
           LLVM_DEBUG(llvm::dbgs()
@@ -1884,9 +1888,19 @@ bool isPromotable(mlir::Value AI) {
         continue;
       }
       if (auto SO = dyn_cast<memref::StoreOp>(U)) {
+        if (val == SO.getValue()) {
+          LLVM_DEBUG(llvm::dbgs() << "cannot promote " << AI
+                                  << " because it is captured in " << SO);
+          return false;
+        }
         continue;
       }
       if (auto SO = dyn_cast<affine::AffineStoreOp>(U)) {
+        if (val == SO.getValue()) {
+          LLVM_DEBUG(llvm::dbgs() << "cannot promote " << AI
+                                  << " because it is captured in " << SO);
+          return false;
+        }
         continue;
       }
       if (isa<memref::DeallocOp>(U)) {

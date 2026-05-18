@@ -161,6 +161,17 @@ ValueCategory MLIRScanner::callHelper(
       Glob.getOrCreateCGFunctionInfo(&Callee);
   auto CalleeArgs = CalleeInfo.arguments();
 
+  const auto &RetAI = CalleeInfo.getReturnInfo();
+  const bool IsSRet =
+      (RetAI.getKind() == clang::CodeGen::ABIArgInfo::Indirect);
+  unsigned SRetArgNo = 0;
+  if (IsSRet) {
+    mlirclang::CodeGen::ClangToLLVMArgMapping Mapping(
+        Glob.getCGM().getContext(), CalleeInfo, /*OnlyRequiredArgs=*/true);
+    assert(Mapping.hasSRetArg() && "Indirect return without sret arg");
+    SRetArgNo = Mapping.getSRetArgNo();
+  }
+
   size_t I = 0;
   // map from declaration name to value
   std::map<std::string, Value> MapFuncOperands;
@@ -393,6 +404,10 @@ ValueCategory MLIRScanner::callHelper(
     Args.push_back(Alloc);
   }
 
+  // Note: sret arg insertion is deferred until after the SYCL-op fast-path
+  // probe below, since SYCL ops model the return value as their op result and
+  // do not want a sret pointer prepended to their argument list.
+
   if (auto *CU = dyn_cast<clang::CUDAKernelCallExpr>(Expr)) {
     auto L0 = Visit(CU->getConfig()->getArg(0));
     assert(L0.isReference);
@@ -477,18 +492,66 @@ ValueCategory MLIRScanner::callHelper(
   }
 
   // Try to rescue some mismatched types.
-  castCallerArgs(ToCall, Args, Builder);
+  // Note: when sret is in use, the callee's MLIR signature has N+1 inputs
+  // (the extra one being the sret slot). The current Args has N entries —
+  // the sret pointer is appended only on the fallback func.CallOp path
+  // below, since SYCL method-op matching does not want a prepended sret arg.
+  if (!IsSRet)
+    castCallerArgs(ToCall, Args, Builder);
 
-  /// Try to emit SYCL operations before creating a CallOp
+  /// Try to emit SYCL operations before creating a CallOp.
+  /// When the callee uses sret, we cannot use the generic `sycl.call` fallback:
+  /// it models the return as an op result, which would disagree with the
+  /// underlying func.func's sret-aware signature (1 extra arg, void return)
+  /// and produce ill-formed IR after lowering. SYCL method ops with their
+  /// own lowering (e.g. sycl.range.get) handle the return semantically and
+  /// are fine, so we still try emitSYCLOps and only discard a generic
+  /// SYCLCallOp result.
   Operation *Op = emitSYCLOps(Expr, Args);
-  if (!Op)
+  if (Op && IsSRet && isa<mlir::sycl::SYCLCallOp>(Op)) {
+    Op->erase();
+    Op = nullptr;
+  }
+
+  bool SRetUsed = false;
+  if (!Op) {
+    if (IsSRet) {
+      assert(!IsArrayReturn && "sret and array-return are mutually exclusive");
+      mlir::Type ElemTy = Glob.getTypes().getMLIRType(RetType);
+      auto Ty = Glob.getTypes().getPointerOrMemRefType(
+          ElemTy, Glob.getCGM().getDataLayout().getAllocaAddrSpace(),
+          /*IsAlloc=*/true);
+
+      OpBuilder ABuilder(Builder.getContext());
+      ABuilder.setInsertionPointToStart(AllocationScope);
+      if (auto MT = dyn_cast<MemRefType>(Ty)) {
+        Alloc = ABuilder.create<memref::AllocaOp>(Loc, MT);
+        Alloc = Builder.create<memref::CastOp>(
+            Loc, MemRefType::get(ShapedType::kDynamic, MT.getElementType()),
+            Alloc);
+      } else {
+        Alloc = ABuilder.create<LLVM::AllocaOp>(
+            Loc, Ty, ElemTy,
+            ABuilder.create<arith::ConstantIntOp>(Loc, 1, 64), 0);
+      }
+      ElementType = ElemTy;
+      Args.insert(Args.begin() + SRetArgNo, Alloc);
+      SRetUsed = true;
+      castCallerArgs(ToCall, Args, Builder);
+    }
     Op = Builder.create<func::CallOp>(Loc, ToCall, Args);
+  }
 
   if (IsArrayReturn) {
     // TODO remedy return
     if (RetReference)
       Expr->dump();
     assert(!RetReference);
+    assert(ElementType && "Expecting element type");
+    return ValueCategory(Alloc, /*isReference*/ true, ElementType);
+  }
+
+  if (SRetUsed) {
     assert(ElementType && "Expecting element type");
     return ValueCategory(Alloc, /*isReference*/ true, ElementType);
   }

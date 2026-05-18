@@ -1117,6 +1117,13 @@ ValueCategory MLIRScanner::VisitReturnStmt(clang::ReturnStmt *Stmt) {
       Builder.create<memref::StoreOp>(
           Loc, Builder.create<memref::LoadOp>(Loc, Rv.val, Idx), Op, Idx);
     }
+  } else if (IsSRet && Stmt->getRetValue()) {
+    auto Rv = Visit(Stmt->getRetValue());
+    assert(Rv.val && "expect right value to be valid");
+    auto ElemTy = Glob.getTypes().getMLIRType(
+        EmittingFunctionDecl->getReturnType());
+    ValueCategory(SRetArg, /*isReference=*/true, ElemTy)
+        .store(Builder, Rv, /*isArray=*/false);
   } else if (Stmt->getRetValue()) {
     auto Rv = Visit(Stmt->getRetValue());
     if (!Stmt->getRetValue()->getType()->isVoidType()) {

@@ -68,7 +68,7 @@ constexpr bool AllowStructFlattening = false;
 
 // Note: cgeist does not allow returning a struct via the parameter list. Need
 // to revisit.
-constexpr bool AllowSRet = false;
+constexpr bool AllowSRet = true;
 
 // Note: cgesit does not allow returning 'inalloca'. Need to revisit.
 constexpr bool AllowInAllocaRet = false;
@@ -254,76 +254,13 @@ static bool isSingleFieldUnion(const clang::RecordDecl *RD) {
 namespace mlirclang {
 namespace CodeGen {
 
-namespace {
-
-/// Encapsulates information about the way function arguments from
-/// CGFunctionInfo should be passed to actual LLVM IR function.
-class ClangToLLVMArgMapping {
-  static const unsigned InvalidIndex = ~0U;
-  unsigned InallocaArgNo;
-  unsigned SRetArgNo;
-  unsigned TotalIRArgs;
-
-  /// Arguments of LLVM IR function corresponding to single Clang argument.
-  struct IRArgs {
-    unsigned PaddingArgIndex;
-    // Argument is expanded to IR arguments at positions
-    // [FirstArgIndex, FirstArgIndex + NumberOfArgs).
-    unsigned FirstArgIndex;
-    unsigned NumberOfArgs;
-
-    IRArgs()
-        : PaddingArgIndex(InvalidIndex), FirstArgIndex(InvalidIndex),
-          NumberOfArgs(0) {}
-  };
-
-  llvm::SmallVector<IRArgs, 8> ArgInfo;
-
-public:
-  ClangToLLVMArgMapping(const clang::ASTContext &Context,
-                        const clang::CodeGen::CGFunctionInfo &FI,
-                        bool OnlyRequiredArgs = false)
-      : InallocaArgNo(InvalidIndex), SRetArgNo(InvalidIndex), TotalIRArgs(0),
-        ArgInfo(OnlyRequiredArgs ? FI.getNumRequiredArgs() : FI.arg_size()) {
-    construct(Context, FI, OnlyRequiredArgs);
-  }
-
-  bool hasInallocaArg() const { return InallocaArgNo != InvalidIndex; }
-  unsigned getInallocaArgNo() const {
-    assert(hasInallocaArg());
-    return InallocaArgNo;
-  }
-
-  bool hasSRetArg() const { return SRetArgNo != InvalidIndex; }
-  unsigned getSRetArgNo() const {
-    assert(hasSRetArg());
-    return SRetArgNo;
-  }
-
-  unsigned totalIRArgs() const { return TotalIRArgs; }
-
-  bool hasPaddingArg(unsigned ArgNo) const {
-    assert(ArgNo < ArgInfo.size());
-    return ArgInfo[ArgNo].PaddingArgIndex != InvalidIndex;
-  }
-  unsigned getPaddingArgNo(unsigned ArgNo) const {
-    assert(hasPaddingArg(ArgNo));
-    return ArgInfo[ArgNo].PaddingArgIndex;
-  }
-
-  /// Returns index of first IR argument corresponding to ArgNo, and their
-  /// quantity.
-  std::pair<unsigned, unsigned> getIRArgs(unsigned ArgNo) const {
-    assert(ArgNo < ArgInfo.size());
-    return std::make_pair(ArgInfo[ArgNo].FirstArgIndex,
-                          ArgInfo[ArgNo].NumberOfArgs);
-  }
-
-private:
-  void construct(const clang::ASTContext &Context,
-                 const clang::CodeGen::CGFunctionInfo &FI,
-                 bool OnlyRequiredArgs);
-};
+ClangToLLVMArgMapping::ClangToLLVMArgMapping(
+    const clang::ASTContext &Context,
+    const clang::CodeGen::CGFunctionInfo &FI, bool OnlyRequiredArgs)
+    : InallocaArgNo(InvalidIndex), SRetArgNo(InvalidIndex), TotalIRArgs(0),
+      ArgInfo(OnlyRequiredArgs ? FI.getNumRequiredArgs() : FI.arg_size()) {
+  construct(Context, FI, OnlyRequiredArgs);
+}
 
 void ClangToLLVMArgMapping::construct(const clang::ASTContext &Context,
                                       const clang::CodeGen::CGFunctionInfo &FI,
@@ -401,7 +338,6 @@ void ClangToLLVMArgMapping::construct(const clang::ASTContext &Context,
 
   TotalIRArgs = IRArgNo;
 }
-} // namespace
 
 CodeGenTypes::CodeGenTypes(clang::CodeGen::CodeGenModule &CGM,
                            mlir::OwningOpRef<mlir::ModuleOp> &Module)
@@ -499,16 +435,8 @@ CodeGenTypes::getFunctionType(const clang::CodeGen::CGFunctionInfo &FI,
     break;
 
   case clang::CodeGen::ABIArgInfo::Indirect:
-    if (!AllowSRet) {
-      // HACK: remove once we can handle function returning a struct.
-      CGEIST_WARNING(llvm::WithColor::warning()
-                     << "function should return its value indirectly (as "
-                        "an extra reference parameter). This is not yet "
-                        "handled by the MLIR codegen\n");
-      QualType Ret = FI.getReturnType();
-      ResultType = getMLIRType(Ret);
-      break;
-    }
+    ResultType = Builder.getNoneType();
+    break;
   case clang::CodeGen::ABIArgInfo::Ignore:
     ResultType = Builder.getNoneType();
     break;
@@ -526,15 +454,16 @@ CodeGenTypes::getFunctionType(const clang::CodeGen::CGFunctionInfo &FI,
   SmallVector<mlir::Type, 8> ArgTypes(NumArgs);
   LLVM_DEBUG(llvm::dbgs() << "NumArgs = " << NumArgs << "\n");
 
+  assert(!(IsArrayReturn && IRFunctionArgs.hasSRetArg()) &&
+         "Array return and sret are mutually exclusive");
+
   // Add type for sret argument.
   if (AllowSRet && IRFunctionArgs.hasSRetArg()) {
-    llvm_unreachable("not implemented");
     QualType Ret = FI.getReturnType();
     mlir::Type Ty = getMLIRType(Ret);
-    unsigned AddressSpace =
-        CGM.getContext().getTargetAddressSpace(Ret.getAddressSpace());
+    unsigned AS = CGM.getDataLayout().getAllocaAddrSpace();
     ArgTypes[IRFunctionArgs.getSRetArgNo()] =
-        getPointerOrMemRefType(Ty, AddressSpace);
+        getPointerOrMemRefType(Ty, AS, /*IsAlloc=*/false);
   }
 
   // Add type for inalloca argument.

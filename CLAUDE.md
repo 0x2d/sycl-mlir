@@ -36,6 +36,8 @@ Available configure flags:
 
 The build uses Ninja by default. Existing build directory is at `build/`. Built tools land in `build/bin/` — the ones used most for MLIR-SYCL work are `cgeist`, `polygeist-opt`, `mlir-opt`, `mlir-translate`, `clang`, and `llvm-spirv`.
 
+**Build vs install:** downstream consumers (e.g. `sycl-bench/build-mlir`) point `CMAKE_CXX_COMPILER` at `build/install/bin/clang++`, which resolves cgeist relative to itself (`build/install/bin/cgeist`). `ninja cgeist` rebuilds `build/bin/cgeist` only — there is no `install-cgeist` target. After iterating on cgeist, copy the freshly-built binary into `install/bin/` (`cp build/bin/cgeist build/install/bin/cgeist`) before re-running downstream benchmarks, otherwise you'll silently test a stale binary. Same caveat applies to `clang++`, `opt`, `llvm-spirv`, `llvm-dis`, `FileCheck`, `count`, `not`, `llvm-lit`.
+
 ## Key Directories
 
 | Directory | Purpose |
@@ -66,6 +68,29 @@ Key MLIR-SYCL components:
 - `mlir-sycl/test/{Dialect,Conversion,Transforms,Analysis}/` - lit tests, organized to mirror `lib/`
 - `polygeist/tools/cgeist/` - C/C++ → MLIR driver (`cgeist`)
 - `polygeist/tools/polygeist-opt/` - opt-style driver for Polygeist + SYCL dialects
+
+### cgeist function-emission machinery
+
+When touching call lowering, function-type construction, or return-value handling in cgeist, the relevant files form a tight cluster:
+
+- `polygeist/tools/cgeist/Lib/CodeGenTypes.{h,cc}` — `getFunctionType` builds the MLIR `FunctionType` from clang's `CGFunctionInfo`, applying ABI lowering. The compile-time `AllowSRet`/`AllowInAllocaRet`/`AllowStructFlattening` flags gate which `ABIArgInfo` kinds are honored. `ClangToLLVMArgMapping` (defined in the header) computes the IR-arg index of the sret slot, the `this` slot, and per-clang-formal arg mappings; reuse this rather than reimplementing.
+- `Lib/CGCall.cc::callHelper` — caller side. Inserts the sret alloca and arg at the right position, and decides whether to take the SYCL fast-path (`emitSYCLOps` → specific method ops or generic `sycl.call`) or fall through to `func::CallOp`. Note the asymmetry: specific SYCL method ops semantically model the return value as the op result and don't want a sret arg, while a generic `sycl.call` references the underlying `func.func` by mangled name and *must* match its signature.
+- `Lib/clang-mlir.cc::MLIRScanner::init` — callee side prologue. Binds clang `ParmVarDecl`s to MLIR `Function.getArgument(...)` slots; when sret is in use the IR has one more arg than the clang formal list, so this loop must use a separate IR-index that skips the sret slot. The `ReturnVal` alloca is created only when `Function.getResultTypes()` is non-empty, so a void-returning sret-aware function gets the right prologue automatically.
+- `Lib/CGStmt.cc::VisitReturnStmt` — callee side return. The `IsArrayReturn` and "normal value" branches need a sibling `IsSRet` branch that stores into the sret pointer via `ValueCategory::store` (not open-coded `memref::StoreOp` — aggregates need the store helper).
+- `Lib/CGExpr.cc::emitSYCLOps` / `EmitSYCLConstructor` / `createSYCLMethodOp` — the SYCL fast-path. `createSYCLMethodOp` succeeds only when the dialect knows the method name on the receiver type (`SYCLDialect::findMethod`); otherwise the generic `SYCLCallOp` fallback fires.
+- `Test/Verification/sycl/` — lit tests. FileCheck patterns here are commonly pinned to function signatures, so any change to ABI handling (sret, byval, flattening) will produce shape-only diffs that need updating.
+
+The `getOrCreateLLVMFunction` path (`clang-mlir.cc:1495`) is a *separate* declaration cache that does NOT apply ABI lowering — it uses `CGM.getTypes().ConvertType(QT)` directly. Symbols emitted through both paths must agree on signature, otherwise phase-3 finalize will fail with `'llvm.call' op incorrect number of operands` after the func→LLVM conversion runs.
+
+## Pipeline phases (driver.cc)
+
+`finalize()` in `polygeist/tools/cgeist/driver.cc` runs three pass managers:
+
+1. **Phase 1 (PM)** — early canonicalization, mem2reg, loop restructuring, affine raising. Operates on `func.func`.
+2. **Phase 2 (PM2)** — SYCL host raising, dialect-level transforms.
+3. **Phase 3 (PM3)** — `arith-expand`, `convert-polygeist-to-llvm` (this is where `func.func` → `llvm.func` and `func.call` → `llvm.call` happen), `reconcile-unrealized-casts`, `legalize-for-spirv`. **This is where ABI mismatches surface as verifier failures.** The error `Finalize failed (phase 3)` followed by `'llvm.call' op incorrect number of operands` is almost always a signature disagreement between a func.func and its call sites.
+
+Use `--mlir-print-ir-before-all --mlir-disable-threading` on cgeist directly to see the IR between passes — useful for diagnosing where IR shape disagrees with what a later pass expects. The clang driver does not propagate these flags; invoke cgeist itself with the captured `--args` line.
 
 ## Testing
 
