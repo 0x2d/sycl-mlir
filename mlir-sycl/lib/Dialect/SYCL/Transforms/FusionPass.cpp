@@ -77,41 +77,64 @@ void FusionPass::runOnOperation() {
   MLIRContext *context = &getContext();
   IRRewriter rewriter(context);
 
-  // Find kernels of Fan1 and Fan2;
-  // Erase .specialized version of kernels
-  llvm::StringRef fan1CalleeName, fan2CalleeName;
-  auto fan1Result = Fan1.walk([&](func::CallOp callOp) {
-    llvm::StringRef calleeName = callOp.getCallee();
-    if (!calleeName.contains(".specialized")) {
-      fan1CalleeName = calleeName;
-      if (scf::IfOp ifOp = llvm::dyn_cast<scf::IfOp>(callOp->getParentOp())) {
-        callOp->moveBefore(ifOp);
-        rewriter.eraseOp(ifOp);
-      }
+  // Find the kernel-body call inside `kernel`. After the inliner runs the
+  // expected shape is:
+  //
+  //   scf.if %cond {
+  //     func.call @body.specialized(...)
+  //   } else {
+  //     func.call @body(...)
+  //   }
+  //
+  // We want the non-specialized call. Helper calls emitted earlier in the
+  // kernel (e.g. sycl::detail::Builder::getElement) must NOT be selected;
+  // they happen to be non-specialized too, and picking one causes the
+  // downstream argument-mapping logic to index past the helper's argument
+  // list. Restrict the search to a non-specialized func.call whose direct
+  // parent is an scf.if whose sibling region holds a `.specialized` call.
+  auto findKernelBodyCall = [](gpu::GPUFuncOp kernel) -> func::CallOp {
+    func::CallOp result;
+    kernel.walk([&](func::CallOp callOp) {
+      if (callOp.getCallee().contains(".specialized"))
+        return WalkResult::advance();
+      auto ifOp = llvm::dyn_cast<scf::IfOp>(callOp->getParentOp());
+      if (!ifOp)
+        return WalkResult::advance();
+      Region *callRegion = callOp->getParentRegion();
+      Region *siblingRegion = (callRegion == &ifOp.getThenRegion())
+                                  ? &ifOp.getElseRegion()
+                                  : &ifOp.getThenRegion();
+      if (siblingRegion->empty())
+        return WalkResult::advance();
+      bool hasSiblingSpecialized = false;
+      siblingRegion->walk([&](func::CallOp other) {
+        if (other.getCallee().contains(".specialized"))
+          hasSiblingSpecialized = true;
+      });
+      if (!hasSiblingSpecialized)
+        return WalkResult::advance();
+      result = callOp;
       return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  auto fan2Result = Fan2.walk([&](func::CallOp callOp) {
-    llvm::StringRef calleeName = callOp.getCallee();
-    if (!calleeName.contains(".specialized")) {
-      fan2CalleeName = calleeName;
-      if (scf::IfOp ifOp = llvm::dyn_cast<scf::IfOp>(callOp->getParentOp())) {
-        callOp->moveBefore(ifOp);
-        rewriter.eraseOp(ifOp);
-      }
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
+    });
+    return result;
+  };
 
-  if (!fan1Result.wasInterrupted() || !fan2Result.wasInterrupted()) {
+  func::CallOp fan1Call = findKernelBodyCall(Fan1);
+  func::CallOp fan2Call = findKernelBodyCall(Fan2);
+  if (!fan1Call || !fan2Call) {
     llvm::dbgs() << "Fusion Pass: Cannot find kernel functions.\n";
     return;
-  } else {
-    llvm::dbgs() << "Fusion Pass: Performing kernel fusion on "
-                 << fan1CalleeName << " and " << fan2CalleeName << "\n";
   }
+  llvm::StringRef fan1CalleeName = fan1Call.getCallee();
+  llvm::StringRef fan2CalleeName = fan2Call.getCallee();
+  for (func::CallOp callOp : {fan1Call, fan2Call}) {
+    auto ifOp = llvm::cast<scf::IfOp>(callOp->getParentOp());
+    callOp->moveBefore(ifOp);
+    rewriter.eraseOp(ifOp);
+  }
+
+  llvm::dbgs() << "Fusion Pass: Performing kernel fusion on "
+               << fan1CalleeName << " and " << fan2CalleeName << "\n";
 
   func::FuncOp fan1CalleeOp, fan2CalleeOp;
   module.walk([&](func::FuncOp op) {

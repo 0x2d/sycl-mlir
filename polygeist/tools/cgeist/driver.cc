@@ -503,9 +503,11 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
     PM.addPass(sycl::createInlinePass({sycl::InlineMode::Simple,
                                        /* RemoveDeadCallees */ true}));
     
-    PM.addPass(sycl::createFusionPass());
-    PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
-    PM.addPass(mlir::createCSEPass());
+    if (EnableFusionPass) {
+      PM.addPass(sycl::createFusionPass());
+      PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+      PM.addPass(mlir::createCSEPass());
+    }
   }
  
   if (PrintPipeline) {

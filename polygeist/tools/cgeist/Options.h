@@ -157,6 +157,10 @@ static llvm::cl::opt<bool>
     DetectReduction("detect-reduction", llvm::cl::init(true),
                     llvm::cl::desc("Detect reduction in inner most loop"));
 
+static llvm::cl::opt<bool>
+    EnableFusionPass("sycl-fusion", llvm::cl::init(true),
+                     llvm::cl::desc("Run the SYCL kernel fusion pass"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 
