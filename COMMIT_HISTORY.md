@@ -192,3 +192,92 @@ Until now, `AllowSRet` in `CodeGenTypes.cc` was hard-coded `false`: any function
 End-to-end effect: a void-returning sret-aware `func.func` is emitted with one extra leading or post-`this` argument (its position chosen by `ClangToLLVMArgMapping`), the callee writes its return value through that pointer, and call sites materialize an alloca, append it at the right index, and project the alloca back as a `ValueCategory` reference. Existing direct-return paths are untouched; the warning emitted by the old fallback no longer fires.
 
 ---
+
+## 4c96259ae4b5a2122bba18089b0323eef79e6604 — Fix kernel-body lookup in SYCL FusionPass
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-05-19
+- **Files:**
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/FusionPass.cpp` (+52 / -29)
+  - `polygeist/tools/cgeist/Options.h` (+4)
+  - `polygeist/tools/cgeist/driver.cc` (+5 / -3)
+
+Fallout from the sret-ABI commit (`1022c039`, "Support SRet aggregate returns in cgeist"). After sret was enabled, an unrelated helper call (e.g. `sycl::detail::Builder::getElement<N>`) survives the SYCL inliner and shows up in the kernel body *before* the `scf.if` that dispatches between the `.specialized` and generic kernel-body callees. The previous heuristic — "first `func.call` in the kernel whose callee name does not contain `.specialized`" — picked that 2-argument helper, and the downstream hard-coded `getArgument(0..5)` mapping then tripped `MutableArrayRef::operator[]`'s "Invalid index!" assertion.
+
+- **`FusionPass.cpp`** — Replaces the per-kernel `walk` with a `findKernelBodyCall(GPUFuncOp)` helper that requires the call to be (a) non-`.specialized`, (b) directly nested inside an `scf.if`, and (c) whose sibling region of that `scf.if` contains a `.specialized` call. That uniquely identifies the inliner's specialized-vs-generic dispatch shape and is independent of which other helpers remain in the kernel body. Hoisting the call out of its enclosing `scf.if` and erasing the `if` is now factored into a small loop over the two found calls, run *after* both have been located (previously each fan's hoist/erase was done inline during the walk). The "Cannot find kernel functions" / "Performing kernel fusion on …" log lines are preserved.
+- **`Options.h`** — New `-sycl-fusion=<bool>` cl::opt (`EnableFusionPass`, default `true`). Escape hatch so the pass can be disabled at runtime if the kernel-body shape doesn't match in some other source.
+- **`driver.cc`** — Wraps the `createFusionPass` + post-fusion canonicalize + CSE additions to `PM` in `if (EnableFusionPass)`. No reordering of any other passes.
+
+Reproducer is `gaussianElim_kernels.cpp` from the 126.ge benchmark — previously crashed in `FusionPass`, now the pass logs `Performing kernel fusion on …_clESD_` on the actual kernel-body callees and the source compiles cleanly. Conceptually narrow: the fusion logic itself is untouched; only the kernel-body discovery is tightened, plus a runtime kill-switch.
+
+---
+
+## fa1ad396a9acc85bd3514ad9d5a331bd1e9ad127 — [SYCL-MLIR] Add SYCL-to-ROCDL lowering for AMDGCN device targets
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-05-26
+- **Files:**
+  - `mlir-sycl/include/mlir/Conversion/SYCLPasses.h` (+1)
+  - `mlir-sycl/include/mlir/Conversion/SYCLPasses.td` (+30 / -1)
+  - `mlir-sycl/include/mlir/Conversion/SYCLToROCDL/SYCLToROCDL.h` (new, +33)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/IR/SYCLAttributes.td` (+2 / -1)
+  - `mlir-sycl/lib/Conversion/CMakeLists.txt` (+1)
+  - `mlir-sycl/lib/Conversion/SYCLToLLVM/CMakeLists.txt` (+2 / -1)
+  - `mlir-sycl/lib/Conversion/SYCLToLLVM/DPCPP.cpp` (+7)
+  - `mlir-sycl/lib/Conversion/SYCLToLLVM/SYCLToLLVM.cpp` (+1)
+  - `mlir-sycl/lib/Conversion/SYCLToROCDL/CMakeLists.txt` (new, +20)
+  - `mlir-sycl/lib/Conversion/SYCLToROCDL/SYCLToROCDL.cpp` (new, +422)
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/global-id.mlir` (new, +53)
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/global-offset.mlir` (new, +20)
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/grid-ops.mlir` (new, +59)
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/sub-group.mlir` (new, +46)
+  - `mlir-sycl/tools/sycl-mlir-opt/CMakeLists.txt` (+1)
+  - `polygeist/include/mlir/Conversion/PolygeistPasses.td` (+4 / -2)
+  - `polygeist/include/mlir/Conversion/PolygeistToLLVM/PolygeistToLLVM.h` (+5)
+  - `polygeist/lib/Conversion/PolygeistToLLVM/CMakeLists.txt` (+1)
+  - `polygeist/lib/Conversion/PolygeistToLLVM/PolygeistToLLVM.cpp` (+30 / -2)
+  - `polygeist/test/polygeist-opt/sycl/rocdl-builtins.mlir` (new, +90)
+  - `polygeist/tools/cgeist/CMakeLists.txt` (+3)
+  - `polygeist/tools/cgeist/Lib/clang-mlir.h` (+2)
+  - `polygeist/tools/cgeist/driver.cc` (+16 / -1)
+  - `polygeist/tools/polygeist-opt/polygeist-opt.cpp` (+3 / -1)
+  - `clang/lib/Driver/ToolChain.cpp` (+12 / -1)
+  - `sycl/plugins/hip/CMakeLists.txt` (+3 / -1)
+  - `BUILD_AMD.md` (new, +214)
+
+End-to-end SYCL-MLIR support for `amdgcn-amd-amdhsa-syclmlir`: a new `-convert-sycl-to-rocdl` dialect-conversion pass, the wiring needed to drive it from `convert-polygeist-to-llvm` and from cgeist's pass pipeline, the clang-driver routing fix that lets the AMDGCN backend job run, an HIP-plugin cmake var, and a build recipe doc.
+
+- **New `LoweringTarget::ROCDL` enum value** — added in `SYCLAttributes.td` (`I32EnumAttrCase` "ROCDL" = 1) and exposed as a `clEnumValN` choice on the `sycl-target` option of both `convert-sycl-to-llvm` and `convert-polygeist-to-llvm`. Selected from the SYCL device triple in cgeist's `getSYCLTargetFromTriple`: `amdgcn-amd-amdhsa` returns `ROCDL`, any other amdgcn variant errors with "amdgcn requires amd-amdhsa vendor/OS".
+- **`SYCLToROCDL` pass** (`mlir-sycl/lib/Conversion/SYCLToROCDL/SYCLToROCDL.cpp`) — operates on each `gpu.module` inside the top-level `ModuleOp`. Patterns:
+  - `NDGridOpPattern<OpTy>` template-instantiated for `SYCLLocalIDOp`, `SYCLWorkGroupIDOp`, `SYCLWorkGroupSizeOp`, `SYCLNumWorkGroupsOp`. Mapping picked through a `RocdlGridKind` enum + `rocdl_kind_of<OpTy>` traits + a switch in `buildRocdlGridDim` that emits the correct ROCDL op for each (kind, dim) pair.
+  - `GlobalIDOpPattern` — synthesizes `global_id_i = workgroup_id_i * workgroup_dim_i + workitem_id_i` per dimension (no single AMDGCN intrinsic).
+  - `NumWorkItemsOpPattern` — `num_work_items_i = workgroup_dim_i * grid_dim_i`.
+  - `GlobalOffsetOpPattern` — fills the result with `i64 0` per dim (HIP/AMDGCN has no kernel-launch global offset).
+  - `SubGroup1DPattern<OpTy>` — emits an `LLVM::LLVMFuncOp` declaration for an `__ockl_get_*` extern (`sub_group_size`, `max_sub_group_size`, `sub_group_id`, `num_sub_groups`, `sub_group_local_id`) and replaces the SYCL op with an `LLVM::CallOp` to it. The HIP device libraries supply the implementation at link time.
+  - **Result-type handling:** `workitem.id`/`workgroup.id` ROCDL ops are constructed as `i32` while `workgroup.dim`/`grid.dim` are constructed as `i64`, matching the LLVM intrinsics each translates to (the `dim` ones lower to the `__ockl_get_local_size` / `__ockl_get_num_groups` ockl calls). Producing the wrong MLIR type would still verify but `translateModuleToLLVMIR` later asserts when an arith op consumes the value, so an explicit `convertScalarToDtype` widens the i32 results before the multiply-add in `GlobalIDOpPattern`.
+  - **Dim mirroring:** SYCL id/range with N dimensions stores values such that index 0 is slowest-varying; AMDGCN exposes dim 0 (X) as fastest-varying. `mirrorIndex<N>` (specialized for N=1/2/3) maps SYCL i to AMDGCN dim — visible in the lit tests as e.g. SYCL dim 0 → `rocdl.workitem.id.z`.
+  - **Pattern benefit = 2** — the catch-all `LLVMOpLowering` in `convert-polygeist-to-llvm` runs at benefit 1 and would otherwise eagerly rebuild SYCL grid ops with a converted (LLVM struct) result type before our patterns can match. The `resultIsSYCLIdOrRange` guard at the top of each pattern returns `failure()` when the pattern fires on a clone whose result type has already been remapped.
+  - **Element accessors:** `createGetOp` switches between `SYCLIDGetOp` / `SYCLRangeGetOp` based on the result's element type; the result of each grid op is materialized as a stack `memref::AllocaOp` of the SYCL id/range type, written per-dim via the get-op + `memref::StoreOp`, then reloaded.
+- **`convert-polygeist-to-llvm` plumbing** (`PolygeistToLLVM.cpp`) — when `syclTarget == ROCDL`:
+  - Skip `populateSPIRVToLLVMConversionPatterns` / `populateSPIRVToLLVMTypeConversion` (no SPIR-V on the AMDGCN path).
+  - Call `populateSYCLToROCDLConversionPatterns` instead of `populateSYCLToSPIRVConversionPatterns`.
+  - Mark the twelve SYCL grid/sub-group ops handled by SYCLToROCDL `addIllegalOp` so the dialect-conversion driver actually invokes our patterns; without this it leaves them legal and they survive as `unrealized_conversion_cast` operands that fail reconciliation.
+  - `addLegalDialect<ROCDL::ROCDLDialect>()` so the driver doesn't roll the rewrite back when no further legalization pattern exists for the just-emitted `rocdl.*` ops.
+  - `dependentDialects` on the pass td gains `ROCDL::ROCDLDialect` and `memref::MemRefDialect`; `PolygeistToLLVM.h` re-exports a few dialect headers for downstream consumers.
+- **`SYCLToLLVM/DPCPP.cpp`** — `populateSYCLToLLVMConversionPatterns` gets a `case LoweringTarget::ROCDL` arm that, for now, reuses the SPIR populate (`populateSYCLToLLVMSPIRConversionPatterns`) — the accessor/range/id struct layout is the same and `targetToAddressSpace` already returns AMDGPU-compatible 1/1/3. Comment notes the place to specialise as divergences surface.
+- **cgeist driver** (`driver.cc`):
+  - On `SYCLIsDevice`, also load `ROCDLDialect` and `AMDGPUDialect`, and register `ROCDLDialectTranslation` so MLIR→LLVM-IR translation knows how to lower the new ops.
+  - In `finalize` phase 3, gate `polygeist::createLegalizeForSPIRVPass()` so it runs on host or SPIR device only — the AMDGCN device path skips it.
+  - `getSYCLTargetFromTriple` extended for `Triple::amdgcn` (returns `ROCDL` when vendor/OS is `amd/amdhsa`, `createStringError` otherwise).
+  - `cgeist/CMakeLists.txt` links `MLIRROCDLDialect`, `MLIRAMDGPUDialect`, and `MLIRROCDLToLLVMIRTranslation`; `clang-mlir.h` includes their headers.
+- **`polygeist-opt` registration** — adds `ROCDL::ROCDLDialect` to the registry so the lit tests under `polygeist-opt --convert-polygeist-to-llvm="sycl-target=rocdl"` can parse and emit ROCDL ops.
+- **Clang-driver routing fix** (`clang/lib/Driver/ToolChain.cpp`) — `SelectTool`'s SYCLMLIR branch was unconditionally returning `getCgeist()` whenever the input was LLVM IR/BC. That broke the AMDGCN device backend (LLC) job, which takes LLVM IR → assembly/object and must run through clang's own backend. Now: route to `mlir-translate` only when the *output* is `TY_MLIR_IR` (the source→MLIR step). When the input is `TY_LLVM_IR`/`TY_LLVM_BC` and the output is not MLIR, return `getClang()` so the LLC-equivalent runs through clang.
+- **HIP plugin cmake var** (`sycl/plugins/hip/CMakeLists.txt`) — new `SYCL_BUILD_PI_HIP_EXTRA_INCLUDE_DIRS` cache string (semicolon-separated), threaded into the plugin's `target_include_directories`. Lets the build inject extra header paths (e.g. the `amd_comgr` shim documented in `BUILD_AMD.md`) without editing source. Marked advanced.
+- **`BUILD_AMD.md`** — new top-level doc capturing the cluster-specific recipe for building `sycl-mlir` against DTK 25.04.1 / gfx906: prerequisite paths, why the stock build script doesn't work (non-interactive conda, hardcoded `/usr/bin/gcc`, DTK lib/include layout), the symlink shim setup for `dtk-libs/`+`dtk-include/amd_comgr/`, the canonical `build/build.sh` invocation, the `DeviceConfigFile.inc` build-graph race workaround, a `clang++ -fsycl-targets=amdgcn-amd-amdhsa-syclmlir` invocation, a Slurm submission template for ORISE, and a troubleshooting table.
+- **lit tests:**
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/{grid-ops,global-id,global-offset,sub-group}.mlir` — unit tests of `sycl-mlir-opt -convert-sycl-to-rocdl` covering the ND grid patterns (1D/2D/3D pinning the dim mirroring), the multiplied-add `global_id`, the multiplied `num_work_items`, the all-zero `global_offset` (with `CHECK-NOT: rocdl.`), and the five sub-group extern-call patterns.
+  - `polygeist/test/polygeist-opt/sycl/rocdl-builtins.mlir` — end-to-end via `polygeist-opt --convert-polygeist-to-llvm="sycl-target=rocdl"`, asserting that after the full lowering the funcs become `llvm.func` and the right `rocdl.*` / `__ockl_*` calls appear inside.
+
+End-to-end effect: a SYCL kernel compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xsycl-target-backend --offload-arch=gfx906` now lowers cleanly through cgeist (source → MLIR with SYCL grid ops), `convert-polygeist-to-llvm sycl-target=rocdl` (SYCL grid ops → ROCDL intrinsics + ockl extern calls in LLVM dialect), MLIR→LLVM-IR translation, and clang's AMDGCN backend → object / a.out, with the HIP plugin loading at runtime. Two sharp edges worth flagging for future work: (1) `SYCLToROCDL.cpp` instantiates a fresh `TypeConverter` whose only conversion is identity, which is enough for the current grid-op patterns but means SYCL types reaching this pass cannot be remapped here; (2) the unified-runtime adapter `CMakeLists.txt` under `build/_deps/` still needs a manual one-line edit (documented in `BUILD_AMD.md`) and is not handled by the new `SYCL_BUILD_PI_HIP_EXTRA_INCLUDE_DIRS` because that var only feeds the SYCL HIP plugin, not the unified-runtime fetch-content target.
+
+---

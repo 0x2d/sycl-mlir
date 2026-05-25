@@ -45,6 +45,25 @@ using namespace mlir::sycl;
 
 namespace {
 
+enum class ArgRole { I32Scalar, Accessor, NDItem, Other };
+
+static ArgRole classifyArg(Type t) {
+  if (t.isInteger(32))
+    return ArgRole::I32Scalar;
+  if (auto m = dyn_cast<MemRefType>(t)) {
+    Type e = m.getElementType();
+    if (e.isInteger(32))
+      return ArgRole::I32Scalar;
+    if (isa<sycl::AccessorType, sycl::LocalAccessorType>(e))
+      return ArgRole::Accessor;
+    if (isa<sycl::NdItemType>(e))
+      return ArgRole::NDItem;
+  }
+  if (isa<sycl::NdItemType>(t))
+    return ArgRole::NDItem;
+  return ArgRole::Other;
+}
+
 class FusionPass : public mlir::sycl::impl::FusionPassBase<FusionPass> {
 public:
   void runOnOperation() final;
@@ -153,14 +172,122 @@ void FusionPass::runOnOperation() {
       llvm::count_if(fan1CalleeBlock.getOperations(), [](mlir::Operation &op) {
         return llvm::isa<scf::IfOp>(op);
       });
-  mapper.map(fan2CalleeOp.getArgument(0), fan1CalleeOp.getArgument(0));
-  mapper.map(fan2CalleeOp.getArgument(1), fan1CalleeOp.getArgument(1));
-  mapper.map(fan2CalleeOp.getArgument(2), fan1CalleeOp.getArgument(3));
-  mapper.map(fan2CalleeOp.getArgument(3), fan1CalleeOp.getArgument(2));
-  mapper.map(fan2CalleeOp.getArgument(4), fan1CalleeOp.getArgument(5));
+
+  SmallVector<std::pair<unsigned, unsigned>> pairing; // (fan2Idx, fan1Idx)
+
+  SmallVector<ArgRole> r1, r2;
+  for (Type t : fan1CalleeOp.getArgumentTypes())
+    r1.push_back(classifyArg(t));
+  for (Type t : fan2CalleeOp.getArgumentTypes())
+    r2.push_back(classifyArg(t));
+
+  unsigned nextI32 = 0, nextAcc = 0;
+  auto findFan1 = [&](ArgRole role, unsigned &cursor) -> int {
+    for (unsigned i = cursor; i < r1.size(); ++i)
+      if (r1[i] == role) {
+        cursor = i + 1;
+        return i;
+      }
+    return -1;
+  };
+  int fan1NDItemIdx = -1;
+  for (unsigned i = 0; i < r1.size(); ++i)
+    if (r1[i] == ArgRole::NDItem) {
+      fan1NDItemIdx = i;
+      break;
+    }
+
+  bool ok = true;
+  for (unsigned j = 0; j < r2.size() && ok; ++j) {
+    int i = -1;
+    switch (r2[j]) {
+    case ArgRole::I32Scalar:
+      i = findFan1(ArgRole::I32Scalar, nextI32);
+      break;
+    case ArgRole::Accessor:
+      i = findFan1(ArgRole::Accessor, nextAcc);
+      break;
+    case ArgRole::NDItem:
+      i = fan1NDItemIdx;
+      break;
+    case ArgRole::Other:
+      ok = false;
+      break;
+    }
+    if (i < 0)
+      ok = false;
+    else
+      pairing.push_back({j, (unsigned)i});
+  }
+  if (!ok) {
+    llvm::dbgs() << "Fusion Pass: Cannot pair Fan1/Fan2 arguments by role.\n";
+    return;
+  }
+  // Special pairing for Fan1 and Fan2
+  pairing[2] = {(unsigned)2, (unsigned)3};
+  pairing[3] = {(unsigned)3, (unsigned)2};
+
+  // Capture Fan1's get_global_id(0) op BEFORE cloning, so we can later
+  // redirect the Fan2-cloned get_global_id(0) consumers to it (and let the
+  // dead nd_item plumbing fall away).
+  sycl::SYCLNDItemGetGlobalIDOp fan1G0Op;
+  fan1CalleeOp.walk([&](sycl::SYCLNDItemGetGlobalIDOp op) {
+    auto indexOp =
+        llvm::dyn_cast_or_null<arith::ConstantOp>(op.getIndex().getDefiningOp());
+    if (!indexOp)
+      return;
+    auto indexAttr = indexOp.getValue().dyn_cast<mlir::IntegerAttr>();
+    if (indexAttr && indexAttr.getInt() == 0) {
+      fan1G0Op = op;
+      return;
+    }
+  });
+
+  rewriter.setInsertionPointToStart(&fan1CalleeBlock);
+  SmallVector<UnrealizedConversionCastOp> insertedCasts;
+  for (auto [j, i] : pairing) {
+    Value f2 = fan2CalleeOp.getArgument(j);
+    Value f1 = fan1CalleeOp.getArgument(i);
+    if (f2.getType() == f1.getType()) {
+      mapper.map(f2, f1);
+    } else {
+      auto cast = rewriter.create<UnrealizedConversionCastOp>(
+          fan1CalleeOp.getLoc(), f2.getType(), f1);
+      mapper.map(f2, cast.getResult(0));
+      insertedCasts.push_back(cast);
+    }
+  }
+
   rewriter.setInsertionPoint(fan1CalleeBlock.getTerminator());
+  llvm::DenseSet<Operation *> clonedOps;
   for (auto &op : fan2CalleeOp.front().without_terminator()) {
-    rewriter.clone(op, mapper);
+    Operation *cloned = rewriter.clone(op, mapper);
+    clonedOps.insert(cloned);
+  }
+
+  // Redirect Fan2-cloned get_global_id(0) -> Fan1's get_global_id(0) result.
+  // This eliminates the only "real" consumers of the cloned nd_item plumbing
+  // (the unrealized_conversion_cast we inserted to bridge nd_item type
+  // divergence between Fan1's 1D and Fan2's 2D nd_item).
+  if (fan1G0Op) {
+    SmallVector<sycl::SYCLNDItemGetGlobalIDOp> fan2G0Cloned;
+    fan1CalleeOp.walk([&](sycl::SYCLNDItemGetGlobalIDOp op) {
+      if (op == fan1G0Op)
+        return;
+      if (!clonedOps.contains(op))
+        return;
+      auto indexOp = llvm::dyn_cast_or_null<arith::ConstantOp>(
+          op.getIndex().getDefiningOp());
+      if (!indexOp)
+        return;
+      auto indexAttr = indexOp.getValue().dyn_cast<mlir::IntegerAttr>();
+      if (indexAttr && indexAttr.getInt() == 0)
+        fan2G0Cloned.push_back(op);
+    });
+    for (auto op : fan2G0Cloned) {
+      op.getRes().replaceAllUsesWith(fan1G0Op.getRes());
+      op->erase();
+    }
   }
 
   // Erase fan2
@@ -278,9 +405,9 @@ void FusionPass::runOnOperation() {
   RewritePatternSet patterns(context);
   populateRegisterPromotion(patterns, context);
   if (failed(applyPatternsAndFoldGreedily(fan1CalleeOp, std::move(patterns)))) {
-    llvm::dbgs() << "Fusion Pass: Find patterns\n";
+    llvm::dbgs() << "Fusion Pass: Find RegisterPromotion pattern\n";
   } else {
-    llvm::dbgs() << "Fusion Pass: Cannot find patterns\n";
+    llvm::dbgs() << "Fusion Pass: Cannot find RegisterPromotion pattern\n";
   }
 
   AnalysisManager am = getAnalysisManager();
