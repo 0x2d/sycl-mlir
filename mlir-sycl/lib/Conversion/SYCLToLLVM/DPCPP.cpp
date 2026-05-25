@@ -2800,5 +2800,12 @@ void mlir::dpcpp::populateSYCLToLLVMConversionPatterns(
   case sycl::LoweringTarget::SPIR:
     populateSYCLToLLVMSPIRConversionPatterns(typeConverter, patterns);
     break;
+  case sycl::LoweringTarget::ROCDL:
+    // The accessor/range/id struct layout is the same across SPIR and ROCDL
+    // targets — `targetToAddressSpace` already returns the AMDGPU-compatible
+    // 1/1/3 mapping. Reuse the SPIR populate as the starting point; specialise
+    // here as divergences surface (e.g. addrspace(4) vs addrspace(0) generic).
+    populateSYCLToLLVMSPIRConversionPatterns(typeConverter, patterns);
+    break;
   }
 }

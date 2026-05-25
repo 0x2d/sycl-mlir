@@ -61,8 +61,10 @@ target_link_libraries(cgeist PRIVATE
   MLIRSupport
   MLIRIR
   MLIRAnalysis
+  MLIRAMDGPUDialect
   MLIRBuiltinToLLVMIRTranslation
   MLIRFuncInlinerExtension
+  MLIRROCDLDialect
   MLIRSPIRVDialect
   MLIRSYCLDialect
   MLIROpenMPDialect
@@ -78,6 +80,7 @@ target_link_libraries(cgeist PRIVATE
   MLIRPolygeistToLLVM
   MLIRPolygeistTransforms
   MLIRLLVMToLLVMIRTranslation
+  MLIRROCDLToLLVMIRTranslation
   MLIRReconcileUnrealizedCasts
   MLIRSCFToOpenMP
   MLIROpenMPToLLVM

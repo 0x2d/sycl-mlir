@@ -132,9 +132,10 @@ def Implementation :
 ////////////////////////////////////////////////////////////////////////////////
 
 def SPIRLoweringTarget : I32EnumAttrCase<"SPIR", 0, "SPIR">;
+def ROCDLLoweringTarget : I32EnumAttrCase<"ROCDL", 1, "ROCDL">;
 
 def LoweringTarget :
     SYCL_I32Enum<"LoweringTarget", "SYCL target representation",
-    [SPIRLoweringTarget]>;
+    [SPIRLoweringTarget, ROCDLLoweringTarget]>;
 
 #endif // SYCL_ATTRIBUTES

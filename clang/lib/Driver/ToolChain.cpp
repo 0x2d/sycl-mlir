@@ -909,9 +909,11 @@ Tool *ToolChain::SelectTool(const JobAction &JA) const {
          JA.getOffloadingToolChain()->getTriple().getEnvironment() ==
              llvm::Triple::SYCLMLIR)) {
       // Compile jobs with a single LLVM input and MLIR output are handled by
-      // mlir-translate.
+      // mlir-translate. Only route to mlir-translate when the output is MLIR;
+      // backend (LLC) jobs that take LLVM IR and emit assembly/object must go
+      // through clang itself.
       const ActionList &Inputs = JA.getInputs();
-      if (Inputs.size() == 1) {
+      if (JA.getType() == types::TY_MLIR_IR && Inputs.size() == 1) {
         switch (Inputs.front()->getType()) {
         case types::TY_LLVM_IR:
         case types::TY_LLVM_BC:
@@ -919,6 +921,13 @@ Tool *ToolChain::SelectTool(const JobAction &JA) const {
         default:
           break;
         }
+      }
+      // For SYCLMLIR offloading: source -> MLIR via cgeist; LLVM IR backend
+      // jobs (e.g. AMDGCN device-side LLC) fall through to clang.
+      if (Inputs.size() == 1) {
+        types::ID InputTy = Inputs.front()->getType();
+        if (InputTy == types::TY_LLVM_IR || InputTy == types::TY_LLVM_BC)
+          return getClang();
       }
       return getCgeist();
     }

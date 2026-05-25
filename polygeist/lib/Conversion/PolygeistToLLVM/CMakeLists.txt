@@ -21,5 +21,6 @@ add_mlir_conversion_library(MLIRPolygeistToLLVM
   MLIRSCFToControlFlow
   MLIRSYCLToLLVM
   MLIRSYCLToMath
+  MLIRSYCLToROCDL
   MLIRVectorToLLVM
 )

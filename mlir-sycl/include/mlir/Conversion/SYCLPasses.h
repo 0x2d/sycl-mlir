@@ -12,6 +12,7 @@
 #include "mlir/Conversion/SYCLToGPU/SYCLToGPU.h"
 #include "mlir/Conversion/SYCLToLLVM/SYCLToLLVM.h"
 #include "mlir/Conversion/SYCLToMath/SYCLToMath.h"
+#include "mlir/Conversion/SYCLToROCDL/SYCLToROCDL.h"
 #include "mlir/Conversion/SYCLToSPIRV/SYCLToSPIRV.h"
 
 namespace mlir {

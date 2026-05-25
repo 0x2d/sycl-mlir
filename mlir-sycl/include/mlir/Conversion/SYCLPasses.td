@@ -23,6 +23,7 @@ def ConvertSYCLToLLVM : Pass<"convert-sycl-to-llvm", "ModuleOp"> {
   }];
   let dependentDialects = [
       "LLVM::LLVMDialect",
+      "ROCDL::ROCDLDialect",
       "arith::ArithDialect",
       "memref::MemRefDialect",
       "spirv::SPIRVDialect",
@@ -44,7 +45,8 @@ def ConvertSYCLToLLVM : Pass<"convert-sycl-to-llvm", "ModuleOp"> {
 	   /*default=*/"::mlir::sycl::LoweringTarget::SPIR",
            "SYCL target for lowering",
            [{::llvm::cl::values(
-             clEnumValN(::mlir::sycl::LoweringTarget::SPIR, "spir", "SPIR")
+             clEnumValN(::mlir::sycl::LoweringTarget::SPIR, "spir", "SPIR"),
+             clEnumValN(::mlir::sycl::LoweringTarget::ROCDL, "rocdl", "ROCDL")
            )}]>,
   ];
 }
@@ -118,6 +120,33 @@ def ConvertSYCLToMath : Pass<"convert-sycl-to-math", "ModuleOp"> {
   }];
   let dependentDialects = [
       "math::MathDialect"
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// SYCLToROCDL
+//===----------------------------------------------------------------------===//
+
+def ConvertSYCLToROCDL : Pass<"convert-sycl-to-rocdl", "ModuleOp"> {
+  let summary = "Convert SYCL dialect to ROCDL dialect";
+  let description = [{
+    Pass to convert supported operations to the ROCDL dialect.
+
+    This pass converts `sycl.global_id`, `sycl.local_id`, `sycl.work_group_id`,
+    `sycl.num_work_items`, `sycl.work_group_size`, `sycl.num_work_groups`,
+    `sycl.global_offset`, and sub-group queries to AMDGCN intrinsics in the
+    ROCDL dialect (`rocdl.workgroup.id.{x,y,z}`, `rocdl.workitem.id.{x,y,z}`,
+    `rocdl.grid_dim.{x,y,z}`, `rocdl.workgroup.dim.{x,y,z}`).
+
+    For builtins without a direct AMDGCN intrinsic counterpart (e.g.
+    `sycl.global_offset`), constants or extern calls are emitted instead.
+  }];
+  let dependentDialects = [
+      "LLVM::LLVMDialect",
+      "ROCDL::ROCDLDialect",
+      "arith::ArithDialect",
+      "memref::MemRefDialect",
+      "vector::VectorDialect"
   ];
 }
 

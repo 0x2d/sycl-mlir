@@ -23,6 +23,7 @@
 #include "mlir/Conversion/SPIRVToLLVM/SPIRVToLLVM.h"
 #include "mlir/Conversion/SYCLToLLVM/SYCLToLLVM.h"
 #include "mlir/Conversion/SYCLToMath/SYCLToMath.h"
+#include "mlir/Conversion/SYCLToROCDL/SYCLToROCDL.h"
 #include "mlir/Conversion/SYCLToSPIRV/SYCLToSPIRV.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/Async/IR/Async.h"
@@ -41,6 +42,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Dialect/SYCL/IR/SYCLOps.h"
 #include "mlir/Dialect/SYCL/IR/SYCLTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -1344,13 +1346,19 @@ public:
 
       constexpr auto clientAPI = spirv::ClientAPI::OpenCL;
 
-      populateSPIRVToLLVMConversionPatterns(converter, patterns, clientAPI);
-      populateSPIRVToLLVMTypeConversion(converter, clientAPI);
+      const bool isROCDL = syclTarget == sycl::LoweringTarget::ROCDL;
+      if (!isROCDL) {
+        populateSPIRVToLLVMConversionPatterns(converter, patterns, clientAPI);
+        populateSPIRVToLLVMTypeConversion(converter, clientAPI);
+      }
 
       populateSYCLToLLVMConversionPatterns(syclImplementation, syclTarget,
                                            converter, patterns);
       populateSYCLToMathConversionPatterns(patterns);
-      populateSYCLToSPIRVConversionPatterns(converter, patterns);
+      if (isROCDL)
+        populateSYCLToROCDLConversionPatterns(converter, patterns);
+      else
+        populateSYCLToSPIRVConversionPatterns(converter, patterns);
       populatePolygeistToLLVMConversionPatterns(converter, patterns);
       populateSCFToControlFlowConversionPatterns(patterns);
       cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
@@ -1433,6 +1441,24 @@ public:
       target.addIllegalDialect<gpu::GPUDialect>();
       target.addIllegalOp<scf::ForOp, scf::IfOp, scf::ParallelOp, scf::WhileOp,
                           scf::ExecuteRegionOp, func::FuncOp>();
+      if (isROCDL) {
+        // Force the SYCL grid/builtin ops handled by SYCLToROCDL to be
+        // converted; otherwise the dialect conversion driver treats them as
+        // legal and our patterns are never invoked, leaving stray
+        // `unrealized_conversion_cast` ops that fail reconciliation.
+        target.addIllegalOp<sycl::SYCLGlobalIDOp, sycl::SYCLLocalIDOp,
+                            sycl::SYCLWorkGroupIDOp, sycl::SYCLWorkGroupSizeOp,
+                            sycl::SYCLNumWorkGroupsOp, sycl::SYCLNumWorkItemsOp,
+                            sycl::SYCLGlobalOffsetOp, sycl::SYCLSubGroupSizeOp,
+                            sycl::SYCLSubGroupMaxSizeOp, sycl::SYCLSubGroupIDOp,
+                            sycl::SYCLNumSubGroupsOp,
+                            sycl::SYCLSubGroupLocalIDOp>();
+        // The SYCLToROCDL patterns produce ROCDL intrinsics; mark the dialect
+        // legal so the dialect conversion driver doesn't roll the rewrite back
+        // when it can't find a legalization pattern for `rocdl.workitem.id.x`
+        // and friends.
+        target.addLegalDialect<ROCDL::ROCDLDialect>();
+      }
       target.addLegalOp<omp::TerminatorOp, omp::TaskyieldOp, omp::FlushOp,
                         omp::YieldOp, omp::BarrierOp, omp::TaskwaitOp>();
       target.addDynamicallyLegalDialect<LLVM::LLVMDialect>(

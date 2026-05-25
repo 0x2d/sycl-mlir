@@ -53,6 +53,7 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Tools/ParseUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -261,6 +262,8 @@ static void loadDialects(MLIRContext &Ctx, const bool SYCLIsDevice) {
   if (SYCLIsDevice) {
     Ctx.getOrLoadDialect<mlir::sycl::SYCLDialect>();
     Ctx.getOrLoadDialect<mlir::spirv::SPIRVDialect>();
+    Ctx.getOrLoadDialect<mlir::ROCDL::ROCDLDialect>();
+    Ctx.getOrLoadDialect<mlir::amdgpu::AMDGPUDialect>();
   }
 
   // TODO: We should not be using these extensions. Make sure we do not generate
@@ -286,6 +289,7 @@ static void registerDialects(MLIRContext &Ctx, const CgeistOptions &options) {
   // TODO: Only register when translating to LLVM.
   mlir::registerBuiltinDialectTranslation(Registry);
   mlir::registerLLVMDialectTranslation(Registry);
+  mlir::registerROCDLDialectTranslation(Registry);
   Ctx.appendDialectRegistry(Registry);
   loadDialects(Ctx, options.getSYCLIsDevice());
 }
@@ -752,6 +756,15 @@ getSYCLTargetFromTriple(const llvm::Triple &Triple) {
     [[fallthrough]];
   case llvm::Triple::spir64:
     return sycl::LoweringTarget::SPIR;
+  case llvm::Triple::amdgcn:
+    if (Triple.getVendor() != llvm::Triple::AMD ||
+        Triple.getOS() != llvm::Triple::AMDHSA)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Cannot lower SYCL target \"%s\" to LLVM: amdgcn requires "
+          "amd-amdhsa vendor/OS",
+          Triple.getTriple().c_str());
+    return sycl::LoweringTarget::ROCDL;
   default:
     return llvm::createStringError(std::errc::not_supported,
                                    "Cannot lower SYCL target \"%s\" to LLVM",
@@ -858,7 +871,9 @@ static LogicalResult finalize(mlir::MLIRContext &Ctx,
       PM3.addPass(createConvertPolygeistToLLVM(ConvertOptions));
       PM3.addPass(createReconcileUnrealizedCastsPass());
       // PM3.addPass(mlir::createLowerFuncToLLVMPass(options));
-      PM3.addPass(polygeist::createLegalizeForSPIRVPass());
+      if (!options.getCgeistOpts().getSYCLIsDevice() ||
+          ConvertOptions.syclTarget == sycl::LoweringTarget::SPIR)
+        PM3.addPass(polygeist::createLegalizeForSPIRVPass());
 
       PM3.addPass(mlir::createCSEPass());
       PM3.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));

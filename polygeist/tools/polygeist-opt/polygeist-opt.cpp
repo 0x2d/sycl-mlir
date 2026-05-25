@@ -23,6 +23,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
@@ -92,7 +93,8 @@ int main(int argc, char **argv) {
   registry.insert<affine::AffineDialect, func::FuncDialect, LLVM::LLVMDialect,
                   memref::MemRefDialect, async::AsyncDialect, func::FuncDialect,
                   arith::ArithDialect, scf::SCFDialect, gpu::GPUDialect,
-                  NVVM::NVVMDialect, omp::OpenMPDialect, math::MathDialect,
+                  NVVM::NVVMDialect, ROCDL::ROCDLDialect, omp::OpenMPDialect,
+                  math::MathDialect,
                   DLTIDialect, polygeist::PolygeistDialect, sycl::SYCLDialect,
                   vector::VectorDialect, spirv::SPIRVDialect>();
 

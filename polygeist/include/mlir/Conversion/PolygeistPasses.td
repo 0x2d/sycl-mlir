@@ -13,7 +13,8 @@ include "mlir/Pass/PassBase.td"
 
 def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp"> {
   let summary = "Convert Polygeist dialect to LLVM dialect";
-  let dependentDialects = ["cf::ControlFlowDialect", "func::FuncDialect", "LLVM::LLVMDialect"];
+  let dependentDialects = ["cf::ControlFlowDialect", "func::FuncDialect", "LLVM::LLVMDialect",
+                           "memref::MemRefDialect", "ROCDL::ROCDLDialect"];
   let options = [
     Option<"emitCWrappers", "emit-c-wrappers", "bool", /*default=*/"false",
            "Emit wrappers for C-compatible pointer-to-struct memref "
@@ -39,7 +40,8 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
 	   /*default=*/"::mlir::sycl::LoweringTarget::SPIR",
            "SYCL target for lowering",
            [{::llvm::cl::values(
-             clEnumValN(::mlir::sycl::LoweringTarget::SPIR, "spir", "SPIR")
+             clEnumValN(::mlir::sycl::LoweringTarget::SPIR, "spir", "SPIR"),
+             clEnumValN(::mlir::sycl::LoweringTarget::ROCDL, "rocdl", "ROCDL")
            )}]>,
   ];
 }

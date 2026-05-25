@@ -10,6 +10,7 @@ set(SYCL_BUILD_PI_HIP_ROCM_DIR "/opt/rocm" CACHE STRING "ROCm installation dir")
 # Set HIP include and lib dirs
 set(SYCL_BUILD_PI_HIP_INCLUDE_DIR "" CACHE STRING "Override HIP include dir path (set to \"\" for default behavior)")
 set(SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR "" CACHE STRING "Override HSA include dir path (set to \"\" for default behavior)")
+set(SYCL_BUILD_PI_HIP_EXTRA_INCLUDE_DIRS "" CACHE STRING "Additional include directories for the HIP plugin (semicolon-separated; useful for non-standard ROCm/DTK header layouts)")
 
 if(SYCL_ENABLE_KERNEL_FUSION)
   set(SYCL_ENABLE_COMGR ON)
@@ -45,7 +46,7 @@ else()
 endif()
 
 # Mark override options for advanced usage
-mark_as_advanced(SYCL_BUILD_PI_HIP_INCLUDE_DIR SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR SYCL_BUILD_PI_HIP_LIB_DIR)
+mark_as_advanced(SYCL_BUILD_PI_HIP_INCLUDE_DIR SYCL_BUILD_PI_HIP_HSA_INCLUDE_DIR SYCL_BUILD_PI_HIP_LIB_DIR SYCL_BUILD_PI_HIP_EXTRA_INCLUDE_DIRS)
 
 # Check if ROCm install paths exists
 # N.B. Doesn't check if all override options are set: HSA and HIP include (and HIP lib for AMD platform)
@@ -114,6 +115,7 @@ add_sycl_plugin(hip
     ${sycl_plugin_dir}
     ${CMAKE_CURRENT_SOURCE_DIR}/../unified_runtime
     ${UNIFIED_RUNTIME_SOURCE_DIR}/source/ # for adapters/hip
+    ${SYCL_BUILD_PI_HIP_EXTRA_INCLUDE_DIRS}
   LIBRARIES
     UnifiedRuntime-Headers
     UnifiedRuntimeCommon

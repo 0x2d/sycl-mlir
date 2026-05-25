@@ -19,8 +19,9 @@ add_mlir_conversion_library(MLIRSYCLToLLVM
   MLIRLLVMDialect
   MLIRMemRefToLLVM
   MLIRPolygeistTransforms
+  MLIRROCDLDialect
   MLIRSPIRVToLLVM
-  MLIRSYCLDialect  
+  MLIRSYCLDialect
   MLIRSYCLToSPIRV
   MLIRTransforms
   MLIRVectorToLLVM
