@@ -35,6 +35,7 @@
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Dialect/Polygeist/IR/PolygeistOps.h"
 #include "mlir/Dialect/Polygeist/Transforms/Passes.h"
@@ -51,6 +52,12 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
+// Private header from upstream MLIR's GPUCommon: the OpToFuncCallLowering
+// template that rewrites a `math::*Op` to `llvm.call @<f32_or_f64_func>`.
+// Used here to bypass `llvm.intr.{sin,cos,...}` for the ROCDL target, since
+// AMDGPU has no f64 ISel pattern for those intrinsics.
+#include "../../../../mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h"
+
 #define DEBUG_TYPE "convert-polygeist-to-llvm"
 
 using namespace mlir;
@@ -61,6 +68,19 @@ namespace mlir {
 #include "mlir/Conversion/PolygeistPasses.h.inc"
 #undef GEN_PASS_DEF_CONVERTPOLYGEISTTOLLVM
 } // namespace mlir
+
+namespace {
+// Register an `OpToFuncCallLowering<OpTy>` pattern with benefit 2 so it wins
+// against the default-benefit `MathToLLVM` pattern for the same op when both
+// are added to the same RewritePatternSet (ROCDL target).
+template <typename OpTy>
+static void addOcmlPattern(LLVMTypeConverter &converter,
+                           RewritePatternSet &patterns, StringRef f32Func,
+                           StringRef f64Func) {
+  patterns.add<OpToFuncCallLowering<OpTy>>(converter, f32Func, f64Func,
+                                           PatternBenefit(2));
+}
+} // namespace
 
 /// Return \p mrTy's address space as an integer (being 0 the default).
 static std::optional<unsigned>
@@ -1355,10 +1375,48 @@ public:
       populateSYCLToLLVMConversionPatterns(syclImplementation, syclTarget,
                                            converter, patterns);
       populateSYCLToMathConversionPatterns(patterns);
-      if (isROCDL)
+      if (isROCDL) {
         populateSYCLToROCDLConversionPatterns(converter, patterns);
-      else
+        // AMDGPU has no f64 ISel pattern for the transcendental LLVM
+        // intrinsics; route the corresponding `math::*Op`s to ocml device
+        // library calls (ocml.bc is linked by the HIPAMD driver). These
+        // patterns are registered with benefit 2 so they win over the default
+        // `MathToLLVM` patterns added below.
+        addOcmlPattern<math::SinOp>(converter, patterns, "__ocml_sin_f32",
+                                    "__ocml_sin_f64");
+        addOcmlPattern<math::CosOp>(converter, patterns, "__ocml_cos_f32",
+                                    "__ocml_cos_f64");
+        addOcmlPattern<math::TanOp>(converter, patterns, "__ocml_tan_f32",
+                                    "__ocml_tan_f64");
+        addOcmlPattern<math::AtanOp>(converter, patterns, "__ocml_atan_f32",
+                                     "__ocml_atan_f64");
+        addOcmlPattern<math::Atan2Op>(converter, patterns, "__ocml_atan2_f32",
+                                      "__ocml_atan2_f64");
+        addOcmlPattern<math::ExpOp>(converter, patterns, "__ocml_exp_f32",
+                                    "__ocml_exp_f64");
+        addOcmlPattern<math::Exp2Op>(converter, patterns, "__ocml_exp2_f32",
+                                     "__ocml_exp2_f64");
+        addOcmlPattern<math::ExpM1Op>(converter, patterns, "__ocml_expm1_f32",
+                                      "__ocml_expm1_f64");
+        addOcmlPattern<math::LogOp>(converter, patterns, "__ocml_log_f32",
+                                    "__ocml_log_f64");
+        addOcmlPattern<math::Log2Op>(converter, patterns, "__ocml_log2_f32",
+                                     "__ocml_log2_f64");
+        addOcmlPattern<math::Log10Op>(converter, patterns, "__ocml_log10_f32",
+                                      "__ocml_log10_f64");
+        addOcmlPattern<math::Log1pOp>(converter, patterns, "__ocml_log1p_f32",
+                                      "__ocml_log1p_f64");
+        addOcmlPattern<math::PowFOp>(converter, patterns, "__ocml_pow_f32",
+                                     "__ocml_pow_f64");
+        addOcmlPattern<math::TanhOp>(converter, patterns, "__ocml_tanh_f32",
+                                     "__ocml_tanh_f64");
+        addOcmlPattern<math::ErfOp>(converter, patterns, "__ocml_erf_f32",
+                                    "__ocml_erf_f64");
+        addOcmlPattern<math::CbrtOp>(converter, patterns, "__ocml_cbrt_f32",
+                                     "__ocml_cbrt_f64");
+      } else {
         populateSYCLToSPIRVConversionPatterns(converter, patterns);
+      }
       populatePolygeistToLLVMConversionPatterns(converter, patterns);
       populateSCFToControlFlowConversionPatterns(patterns);
       cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);

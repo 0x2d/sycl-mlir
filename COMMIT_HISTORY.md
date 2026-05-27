@@ -301,3 +301,29 @@ Fallout from the AMDGCN device-target work (`fa1ad39`). Under the SPIR64 target,
 End-to-end: `gaussianElim_mono` from 126.ge now compiles to a gfx906 a.out under fusion, with the cloned Fan2 body sharing Fan1's induction variable and the bridging cast getting eliminated downstream. One sharp edge: the post-role-pairing overwrite of indices 2/3 still bakes in the 126.ge swap, so a Fan1/Fan2 pair from a different benchmark whose accessor argument order doesn't match this pattern would silently get the wrong mapping; future work is to drive that swap from a structural cue (e.g. how each accessor is indexed) rather than its ordinal.
 
 ---
+
+## 5d965598669e — [SYCL-MLIR] Make FusionPass RegisterPromotion fire under AMDGCN
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-05-27
+- **Files:**
+  - `polygeist/tools/cgeist/Lib/CGExpr.cc` (+35)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Utils/Utils.h` (+1 / -1)
+  - `mlir-sycl/lib/Dialect/SYCL/Utils/Utils.cpp` (+33 / -28)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/RegisterPromotionPattern.cpp` (+8 / -6)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/FusionPass.cpp` (+2 / -2)
+  - `COMMIT_HISTORY.md` (+20)
+
+Follow-on to the AMDGCN device-target enablement (`fa1ad39`) and the FusionPass arg-pairing fix (`2523e7e1`). Under SPIR64 the index operand to `sycl.accessor.subscript` arrives as a `memref.cast` of an alloca of `!sycl.id` (i.e. the SPIR64 by-pointer ABI for small aggregates). Under `amdgcn-amd-amdhsa-syclmlir` the Direct ABI passes `sycl::id` by-value, so the same operand arrives as a load of an `!sycl.id` value — which the typed `sycl.accessor.subscript` op refuses to verify (its index is constrained to `memref<?x!sycl.id>`). Two consequences: (a) the typed op was never built on AMDGCN, so `sycl.accessor.subscript` ops did not appear in the kernel and the `RegisterPromotion` pattern had nothing to match; (b) `getOffsetFromSubscriptOp`'s SPIR64-shaped chain walk (`memref.cast → affine.store → affine.load → memref.cast → memref.memory_space_cast → sycl.constructor`) does not exist on AMDGCN even when the typed op is present.
+
+- **`CGExpr.cc`** — New file-local helper `rewriteIDLoadToMemRefCast(Builder, V)` and a corresponding loop inserted into `createSYCLMethodOp`. The helper checks whether `V` has type `sycl::IDType` and was defined by an `affine.load` / `memref.load`; if so, it materializes a `memref::CastOp` from the source memref to `memref<?x!sycl.id>` (`ShapedType::kDynamic`) in the source memory space and returns the cast result. `createSYCLMethodOp` runs this over every operand from index 1 onward (right after the existing `abstractCasts` on operand 0). Operand 0 is the receiver (the accessor) and is left untouched. The rewrite restores the SPIR64-shape index operand on AMDGCN so the typed subscript op verifies; on SPIR64 the helper short-circuits (the operand is not produced by a load of `!sycl.id`) and behavior is unchanged.
+- **`Utils.h` / `Utils.cpp`** — `getOffsetFromSubscriptOp` gains a second parameter `StringAttr &tripleAttr` and is split into two arms keyed on its value:
+  - `"spir64-unknown-unknown-syclmlir"` — preserves the existing six-step chain walk verbatim.
+  - `"amdgcn-amd-amdhsa-syclmlir"` — walks `op.getIndex().getUsers()` directly looking for the `sycl::SYCLConstructorOp` whose first arg is the offset. Shorter because the AMDGCN-side index is a value (the loaded `sycl::id`) directly consumed by both the constructor that built it and the (newly-inserted) `memref.cast` feeding the subscript, rather than being routed through an alloca.
+  - Anything else falls through with `offset` left default-constructed; a future non-SPIR/AMDGCN target would need a third arm.
+- **`RegisterPromotionPattern.cpp`** — Threads the triple. Adds includes for `LLVM::LLVMDialect` and `BuiltinAttributes`, reads `llvm.target_triple` off the parent `ModuleOp` via `LLVM::LLVMDialect::getTargetTripleAttrName()`, and passes it into both `getOffsetFromSubscriptOp` calls (the load-side and the back-scan store-side). Deletes the local `curAcc`/`curIndex` shadows and uses `loadOp.getAcc()` directly in the equivalence check. Adds a `dbgs() << "Fusion Pass: Find RegisterPromotion pattern\n"` print *inside* the success branch (i.e. only when an actual `replaceAllUsesWith` happened), distinct from the per-`applyPatternsAndFoldGreedily` log in `FusionPass.cpp`.
+- **`FusionPass.cpp`** — Flips the polarity of the post-`applyPatternsAndFoldGreedily` log lines, which were inverted: `failed(...)` now prints `"RegisterPromotion pattern not converge"` and the success arm prints `"RegisterPromotion pattern converged"`. Previously the failure path printed the find-message and vice versa, which had been mildly misleading since the pattern was introduced.
+
+End-to-end: under `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir`, cgeist now emits typed `sycl.accessor.subscript` ops with a `memref.cast`-shaped index (matching SPIR64), `getOffsetFromSubscriptOp` resolves the offset on the AMDGCN-shaped def-use graph, and `RegisterPromotion` fires on `gaussianElim_mono` exactly as it did on SPIR64. Two sharp edges worth flagging: (1) `Utils.cpp` still ends without a trailing newline (introduced in `e4064e58` and not addressed here); (2) `getOffsetFromSubscriptOp` takes `StringAttr &tripleAttr` by non-const reference even though it only reads it — should be `StringAttr` by value or `const StringAttr &` if a future non-null-or-default precondition is added.
+
+---

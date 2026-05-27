@@ -31,8 +31,8 @@ template <typename SourceOp>
 struct OpToFuncCallLowering : public ConvertOpToLLVMPattern<SourceOp> {
 public:
   explicit OpToFuncCallLowering(LLVMTypeConverter &lowering, StringRef f32Func,
-                                StringRef f64Func)
-      : ConvertOpToLLVMPattern<SourceOp>(lowering), f32Func(f32Func),
+                                StringRef f64Func, PatternBenefit benefit = 1)
+      : ConvertOpToLLVMPattern<SourceOp>(lowering, benefit), f32Func(f32Func),
         f64Func(f64Func) {}
 
   LogicalResult

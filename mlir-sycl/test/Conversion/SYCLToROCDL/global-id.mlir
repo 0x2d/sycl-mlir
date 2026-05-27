@@ -7,12 +7,16 @@
 module attributes {gpu.container_module} {
   gpu.module @kernels {
     // global_id_i = workgroup_id_i * workgroup_dim_i + workitem_id_i, per dim.
+    // BlockId/ThreadId are i32 (intrinsics); BlockDim is i64 (ockl call), so
+    // BlockId/ThreadId are extended to i64 before the muli/addi.
     // CHECK-LABEL: func.func @test_global_id_1
     // CHECK:         %[[BID:.*]] = rocdl.workgroup.id.x
     // CHECK:         %[[BDIM:.*]] = rocdl.workgroup.dim.x
     // CHECK:         %[[TID:.*]] = rocdl.workitem.id.x
-    // CHECK:         %[[MUL:.*]] = arith.muli %[[BID]], %[[BDIM]]
-    // CHECK:         arith.addi %[[MUL]], %[[TID]]
+    // CHECK:         %[[BIDX:.*]] = arith.extsi %[[BID]] : i32 to i64
+    // CHECK:         %[[TIDX:.*]] = arith.extsi %[[TID]] : i32 to i64
+    // CHECK:         %[[MUL:.*]] = arith.muli %[[BIDX]], %[[BDIM]]
+    // CHECK:         arith.addi %[[MUL]], %[[TIDX]]
     func.func @test_global_id_1() -> !sycl_id_1_ {
       %0 = sycl.global_id : !sycl_id_1_
       return %0 : !sycl_id_1_
