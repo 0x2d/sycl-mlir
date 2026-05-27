@@ -405,9 +405,9 @@ void FusionPass::runOnOperation() {
   RewritePatternSet patterns(context);
   populateRegisterPromotion(patterns, context);
   if (failed(applyPatternsAndFoldGreedily(fan1CalleeOp, std::move(patterns)))) {
-    llvm::dbgs() << "Fusion Pass: Find RegisterPromotion pattern\n";
+    llvm::dbgs() << "Fusion Pass: RegisterPromotion pattern not converge\n";
   } else {
-    llvm::dbgs() << "Fusion Pass: Cannot find RegisterPromotion pattern\n";
+    llvm::dbgs() << "Fusion Pass: RegisterPromotion pattern converged\n";
   }
 
   AnalysisManager am = getAnalysisManager();

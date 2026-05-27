@@ -1163,6 +1163,36 @@ tryToCreateOperation(OpBuilder &builder, Location loc, StringAttr opName,
   return op;
 }
 
+// On targets that pass `sycl::id` by-value (e.g. AMDGCN's Direct ABI for
+// small aggregates), the typed `sycl.accessor.subscript` op cannot be built
+// because its index operand is constrained to memref-of-id (SPIR64's
+// by-pointer shape). Recover the SPIR64 shape by walking back through a
+// load-from-alloca and substituting a memref.cast of the source memref.
+// Returns the original value if no rewrite applies.
+static mlir::Value rewriteIDLoadToMemRefCast(OpBuilder &Builder,
+                                             mlir::Value V) {
+  auto IDTy = dyn_cast<sycl::IDType>(V.getType());
+  if (!IDTy)
+    return V;
+  Operation *Def = V.getDefiningOp();
+  if (!Def)
+    return V;
+  mlir::Value SrcMemref;
+  if (auto LA = dyn_cast<affine::AffineLoadOp>(Def))
+    SrcMemref = LA.getMemref();
+  else if (auto ML = dyn_cast<memref::LoadOp>(Def))
+    SrcMemref = ML.getMemref();
+  else
+    return V;
+  auto SrcTy = dyn_cast<MemRefType>(SrcMemref.getType());
+  if (!SrcTy || SrcTy.getElementType() != IDTy)
+    return V;
+  auto DynTy = MemRefType::get({ShapedType::kDynamic}, IDTy,
+                               MemRefLayoutAttrInterface(),
+                               SrcTy.getMemorySpace());
+  return Builder.create<memref::CastOp>(Def->getLoc(), DynTy, SrcMemref);
+}
+
 llvm::Optional<sycl::SYCLMethodOpInterface>
 MLIRScanner::createSYCLMethodOp(llvm::StringRef FunctionName,
                                 mlir::ValueRange Operands,
@@ -1182,6 +1212,11 @@ MLIRScanner::createSYCLMethodOp(llvm::StringRef FunctionName,
   // Cast operations are abstracted to avoid missing method calls due to
   // implementation details.
   OperandsCpy[0] = sycl::abstractCasts(OperandsCpy[0]);
+
+  // Recover the SPIR64-shape `memref<?x!sycl.id>` index operand on targets
+  // that pass `sycl::id` by-value, so the typed op's verifier accepts it.
+  for (unsigned I = 1; I < OperandsCpy.size(); ++I)
+    OperandsCpy[I] = rewriteIDLoadToMemRefCast(Builder, OperandsCpy[I]);
 
   auto BaseType = cast<MemRefType>(OperandsCpy[0].getType());
   const llvm::Optional<llvm::StringRef> OptOpName = SYCLDialect->findMethod(

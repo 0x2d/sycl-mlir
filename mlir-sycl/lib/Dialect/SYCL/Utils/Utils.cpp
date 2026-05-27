@@ -129,40 +129,45 @@ LogicalResult sycl::checkEquivalent(Value lhs, Value rhs) {
   }
 }
 
-Value sycl::getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op) {
-  // Information of current load op
-  Value curAcc = op.getAcc();
-  Value curIndex = op.getIndex();
+Value sycl::getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op, StringAttr &tripleAttr) {
+  Value memLoc1, memId1, memLoc2, memCast2, offset;
 
-  // Get load address
-  Value memLoc1 = llvm::dyn_cast<memref::CastOp>(curIndex.getDefiningOp()).getSource();
-  Value memId1;
-  for (auto user: memLoc1.getUsers()) {
-    if (auto storeUser = llvm::dyn_cast<affine::AffineStoreOp>(user)) {
-      memId1 = storeUser.getValue();
-      break;
-    }
-  }
-  Value memLoc2 = llvm::dyn_cast<affine::AffineLoadOp>(memId1.getDefiningOp()).getMemref();
-  Value memCast2;
-  for (auto user: memLoc2.getUsers()) {
-    if (auto castUser = llvm::dyn_cast<memref::CastOp>(user)) {
-      for (auto userInner: castUser.getDest().getUsers()) {
-        if (auto castUserInner = llvm::dyn_cast<memref::MemorySpaceCastOp>(userInner)) {
-          memCast2 = castUserInner.getDest();
-          break;
-        }
+  if (tripleAttr.getValue() == "spir64-unknown-unknown-syclmlir") {
+    memLoc1 = llvm::dyn_cast<memref::CastOp>(op.getIndex().getDefiningOp()).getSource();
+    for (auto user: memLoc1.getUsers()) {
+      if (auto storeUser = llvm::dyn_cast<affine::AffineStoreOp>(user)) {
+        memId1 = storeUser.getValue();
+        break;
       }
-      break;
+    }
+    memLoc2 = llvm::dyn_cast<affine::AffineLoadOp>(memId1.getDefiningOp()).getMemref();
+    for (auto user: memLoc2.getUsers()) {
+      if (auto castUser = llvm::dyn_cast<memref::CastOp>(user)) {
+        for (auto userInner: castUser.getDest().getUsers()) {
+          if (auto castUserInner = llvm::dyn_cast<memref::MemorySpaceCastOp>(userInner)) {
+            memCast2 = castUserInner.getDest();
+            break;
+          }
+        }
+        break;
+      }
+    }
+    for (auto user: memCast2.getUsers()) {
+      if (auto idUser = llvm::dyn_cast<sycl::SYCLConstructorOp>(user)) {
+        auto idArgs = idUser.getArgs();
+        offset = idArgs[0];
+        break;
+      }
+    }
+  } else if (tripleAttr.getValue() == "amdgcn-amd-amdhsa-syclmlir") {
+    for (auto user: op.getIndex().getUsers()) {
+      if (auto idUser = llvm::dyn_cast<sycl::SYCLConstructorOp>(user)) {
+        auto idArgs = idUser.getArgs();
+        offset = idArgs[0];
+        break;
+      }
     }
   }
-  Value offset;
-  for (auto user: memCast2.getUsers()) {
-    if (auto idUser = llvm::dyn_cast<sycl::SYCLConstructorOp>(user)) {
-      auto idArgs = idUser.getArgs();
-      offset = idArgs[0];
-      break;
-    }
-  }
+
   return offset;
 }

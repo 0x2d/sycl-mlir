@@ -65,7 +65,7 @@ void populateLocalID(SmallVectorImpl<Value> &localIDs, unsigned numDims,
 // Check equivalent of two values
 LogicalResult checkEquivalent(Value lhs, Value rhs);
 
-Value getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op);
+Value getOffsetFromSubscriptOp(sycl::SYCLAccessorSubscriptOp op, StringAttr &tripleAttr);
 
 } // namespace sycl
 } // namespace mlir

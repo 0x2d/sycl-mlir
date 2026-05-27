@@ -1,8 +1,10 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SYCL/IR/SYCLOps.h"
 #include "mlir/Dialect/SYCL/Transforms/Passes.h"
 #include "mlir/Dialect/SYCL/Utils/Utils.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -19,9 +21,8 @@ struct RegisterPromotion
 
   LogicalResult matchAndRewrite(sycl::SYCLAccessorSubscriptOp loadOp,
                                 PatternRewriter &rewriter) const override {
-    // Information of current load op
-    Value curAcc = loadOp.getAcc();
-    Value curIndex = loadOp.getIndex();
+    ModuleOp module = loadOp->getParentOfType<ModuleOp>();
+    auto tripleAttr = module->getAttrOfType<StringAttr>(LLVM::LLVMDialect::getTargetTripleAttrName());
 
     // Match if next op is affine.load
     if (!llvm::isa<affine::AffineLoadOp>(loadOp->getNextNode())) {
@@ -29,7 +30,7 @@ struct RegisterPromotion
     }
 
     // Get load address
-    Value loadOffset = getOffsetFromSubscriptOp(loadOp);
+    Value loadOffset = getOffsetFromSubscriptOp(loadOp, tripleAttr);
     // Get store op
     func::FuncOp funcOp = loadOp->getParentOfType<func::FuncOp>();
     llvm::SmallVector<Operation *> opsBeforeLoad;
@@ -46,8 +47,8 @@ struct RegisterPromotion
     for (Operation* op : llvm::reverse(opsBeforeLoad)) {
       if (auto sOp = llvm::dyn_cast<sycl::SYCLAccessorSubscriptOp>(op)) {
         if (llvm::isa<affine::AffineStoreOp>(sOp->getNextNode())) {
-          Value storeOffset = getOffsetFromSubscriptOp(sOp);
-          if (curAcc == sOp.getAcc() || succeeded(checkEquivalent(loadOffset, storeOffset))) {
+          Value storeOffset = getOffsetFromSubscriptOp(sOp, tripleAttr);
+          if (loadOp.getAcc() == sOp.getAcc() || succeeded(checkEquivalent(loadOffset, storeOffset))) {
             storeOp = sOp;
             break;
           }
@@ -60,6 +61,7 @@ struct RegisterPromotion
       Value storeTmpValue = storeNextOp.getValue();
       Value loadTmpValue = loadNextOp.getValue();
       rewriter.replaceAllUsesWith(loadTmpValue, storeTmpValue);
+      llvm::dbgs() << "Fusion Pass: Find RegisterPromotion pattern\n";
     }
     return success();
   }
