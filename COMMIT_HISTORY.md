@@ -327,3 +327,26 @@ Follow-on to the AMDGCN device-target enablement (`fa1ad39`) and the FusionPass 
 End-to-end: under `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir`, cgeist now emits typed `sycl.accessor.subscript` ops with a `memref.cast`-shaped index (matching SPIR64), `getOffsetFromSubscriptOp` resolves the offset on the AMDGCN-shaped def-use graph, and `RegisterPromotion` fires on `gaussianElim_mono` exactly as it did on SPIR64. Two sharp edges worth flagging: (1) `Utils.cpp` still ends without a trailing newline (introduced in `e4064e58` and not addressed here); (2) `getOffsetFromSubscriptOp` takes `StringAttr &tripleAttr` by non-const reference even though it only reads it — should be `StringAttr` by value or `const StringAttr &` if a future non-null-or-default precondition is added.
 
 ---
+
+## 75978e743de7 — [SYCL-MLIR] Route ROCDL transcendentals through ocml device library
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-05-27
+- **Files:**
+  - `mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h` (+2 / -2)
+  - `polygeist/lib/Conversion/PolygeistToLLVM/PolygeistToLLVM.cpp` (+60 / -2)
+  - `polygeist/test/polygeist-opt/rocdl-math-ops.mlir` (new, +59)
+  - `mlir-sycl/test/Conversion/SYCLToROCDL/global-id.mlir` (+6 / -2)
+  - `COMMIT_HISTORY.md` (+26)
+
+AMDGPU has no f64 ISel pattern for the transcendental LLVM intrinsics (`llvm.intr.sin`, `cos`, `exp`, `log`, `pow`, …), so once `convert-polygeist-to-llvm` reached `MathToLLVM` on an AMDGCN target, any kernel using `math.*` on f64 would lower to `llvm.intr.*` and then fail in the AMDGPU backend at codegen. Fix: re-route those ops to the AMD ocml device library (linked at HIP-driver finalize time via `ocml.bc`) on the ROCDL `sycl-target` only, leaving the SPIR-V path untouched.
+
+- **`OpToFuncCallLowering.h`** — Upstream MLIR `GPUCommon/OpToFuncCallLowering` (the template that rewrites a `math::*Op` to `llvm.call @<f32_or_f64_func>` based on operand type) was hard-wired to default `PatternBenefit`. Adds an optional `PatternBenefit benefit = 1` ctor parameter and forwards it to `ConvertOpToLLVMPattern<SourceOp>`'s base. Tiny upstream-shaped change, default-compatible.
+- **`PolygeistToLLVM.cpp`** — Includes `Math/IR/Math.h` and reaches into the upstream private header via a relative include (`../../../../mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h`) — annotated with a comment block explaining why. New file-local `addOcmlPattern<OpTy>(converter, patterns, f32, f64)` helper registers an `OpToFuncCallLowering<OpTy>` with `PatternBenefit(2)` so it wins against the default-benefit `MathToLLVM` pattern when both end up in the same `RewritePatternSet`. Inside `convert-polygeist-to-llvm`, on the existing `if (isROCDL)` arm — right after `populateSYCLToROCDLConversionPatterns` — registers the ocml redirect for sixteen ops: `math::{Sin,Cos,Tan,Atan,Atan2,Exp,Exp2,ExpM1,Log,Log2,Log10,Log1p,PowF,Tanh,Erf,Cbrt}Op` paired with `__ocml_<name>_{f32,f64}`. Notable omission: `math::SqrtOp` is intentionally not redirected — AMDGPU has a native f64 ISel pattern for `llvm.intr.sqrt`, so going through ocml would lose performance. The SPIR-V `else` branch is unchanged.
+- **`polygeist/test/polygeist-opt/rocdl-math-ops.mlir`** — New lit test with two `RUN` lines (`sycl-target=rocdl` vs default SPIR-V) and matching `ROCDL` / `SPIRV` check prefixes. Covers: f64 transcendentals chain (`sin`/`cos`/`tan`/`exp`/`log`/`powf`) lower to `llvm.call @__ocml_*_f64` under ROCDL but stay as `llvm.intr.*` under SPIR-V; a separate f32 chain confirms the `_f32` suffix is picked correctly; a regression-guard function asserts `math.sqrt` lowers to `llvm.intr.sqrt` and emphatically NOT to `__ocml_sqrt_f64` even on the ROCDL path.
+- **`mlir-sycl/test/Conversion/SYCLToROCDL/global-id.mlir`** — Test-only update for the i32/i64 mismatch fix already in `SYCLToROCDL.cpp` (workitem.id/workgroup.id materialize as i32, workgroup.dim as i64). The `CHECK` lines now expect `arith.extsi %BID : i32 to i64` and `arith.extsi %TID : i32 to i64` ahead of the `muli`/`addi`. Comment is added inline explaining why both extensions appear. No source change here — the test just catches up to the lowering's actual output.
+- **`COMMIT_HISTORY.md`** — Backfills the entry for `5d965598669e` ("Make FusionPass RegisterPromotion fire under AMDGCN") that wasn't logged when first committed.
+
+End-to-end effect: a SYCL kernel using f64 transcendentals (e.g. `sycl::sin`, `std::exp`, `std::pow` over `double`) now compiles cleanly under `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir`. After `convert-polygeist-to-llvm sycl-target=rocdl`, `math.*Op`s become `llvm.call @__ocml_*_f64` rather than `llvm.intr.*`, and the AMDGPU backend resolves the calls against the ocml.bc bitcode that the HIP driver links at finalize. SPIR64 is byte-identical to before. One sharp edge: the relative include `../../../../mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h` reaches into MLIR's private headers and will silently break if upstream restructures `GPUCommon/`; long-term the right move is either to upstream the header to `include/mlir/Conversion/GPUCommon/` or copy the small template into mlir-sycl.
+
+---

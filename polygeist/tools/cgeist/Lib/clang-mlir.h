@@ -36,6 +36,7 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/HeaderSearch.h"
 #include "clang/Lex/HeaderSearchOptions.h"
 #include "clang/Lex/Preprocessor.h"
@@ -133,6 +134,9 @@ private:
   clang::SourceManager &SM;
   std::unique_ptr<llvm::LLVMContext> Lcontext;
   llvm::Module LLVMMod;
+  // Sets LLVMMod's DataLayout from the target before CGM reads it; the
+  // initializer order matters because CGM (next member) caches DL info.
+  bool DataLayoutInitialized;
   clang::CodeGen::CodeGenModule CGM;
   mlirclang::CodeGen::CodeGenTypes CGTypes;
   bool Error;
@@ -161,6 +165,10 @@ public:
         LLVMGlobals(LLVMGlobals), LLVMFunctions(LLVMFunctions),
         FunctionsToEmit(), Module(Module), SM(SM), Lcontext(std::move(LCtx)),
         LLVMMod(ModuleId, *Lcontext),
+        DataLayoutInitialized(
+            (LLVMMod.setDataLayout(
+                 AstContext.getTargetInfo().getDataLayoutString()),
+             true)),
         CGM(AstContext, &SM.getFileManager().getVirtualFileSystem(),
             PP.getHeaderSearchInfo().getHeaderSearchOpts(),
             PP.getPreprocessorOpts(), Codegenops, LLVMMod, PP.getDiagnostics()),
