@@ -18,11 +18,17 @@ void compute(struct fin f) {
 
 // CHECK-LABEL:   func.func @compute(
 // CHECK-SAME:                       %[[VAL_0:.*]]: !llvm.ptr) attributes {llvm.linkage = #llvm.linkage<external>} {
-// CHECK-NEXT:      %[[VAL_1:.*]] = llvm.getelementptr inbounds %[[VAL_0]][0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(struct<(i64, i8)>, i8)>
-// CHECK-NEXT:      %[[VAL_2:.*]] = llvm.load %[[VAL_1]] : !llvm.ptr -> !llvm.struct<(i64, i8)>
-// CHECK-NEXT:      %[[VAL_3:.*]] = llvm.getelementptr inbounds %[[VAL_0]][0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(struct<(i64, i8)>, i8)>
-// CHECK-NEXT:      %[[VAL_4:.*]] = llvm.load %[[VAL_3]] : !llvm.ptr -> i8
-// CHECK-NEXT:      %[[VAL_5:.*]] = call @run(%[[VAL_2]], %[[VAL_4]]) : (!llvm.struct<(i64, i8)>, i8) -> i64
+// CHECK:           %[[VAL_1:.*]] = llvm.alloca {{.*}} x !llvm.struct<(i64, i8)> : (i64) -> !llvm.ptr
+// CHECK-NEXT:      %[[VAL_2:.*]] = llvm.getelementptr inbounds %[[VAL_0]][0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(struct<(i64, i8)>, i8)>
+// CHECK-NEXT:      %[[VAL_3:.*]] = llvm.load %[[VAL_2]] : !llvm.ptr -> !llvm.struct<(i64, i8)>
+// CHECK-NEXT:      %[[VAL_4:.*]] = llvm.getelementptr inbounds %[[VAL_0]][0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(struct<(i64, i8)>, i8)>
+// CHECK-NEXT:      %[[VAL_5:.*]] = llvm.load %[[VAL_4]] : !llvm.ptr -> i8
+// CHECK-NEXT:      llvm.store %[[VAL_3]], %[[VAL_1]] : !llvm.struct<(i64, i8)>, !llvm.ptr
+// CHECK-NEXT:      %[[VAL_6:.*]] = llvm.getelementptr %[[VAL_1]][0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, i8)>
+// CHECK-NEXT:      %[[VAL_7:.*]] = llvm.load %[[VAL_6]] : !llvm.ptr -> i64
+// CHECK-NEXT:      %[[VAL_8:.*]] = llvm.getelementptr %[[VAL_1]][0, 1] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<(i64, i8)>
+// CHECK-NEXT:      %[[VAL_9:.*]] = llvm.load %[[VAL_8]] : !llvm.ptr -> i8
+// CHECK-NEXT:      %[[VAL_10:.*]] = call @run(%[[VAL_7]], %[[VAL_9]], %[[VAL_5]]) : (i64, i8, i8) -> i64
 // CHECK-NEXT:      return
 // CHECK-NEXT:    }
 

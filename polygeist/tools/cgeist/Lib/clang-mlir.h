@@ -268,7 +268,7 @@ private:
   mlir::Block *EntryBlock;
   std::vector<LoopContext> Loops;
   mlir::Block *AllocationScope;
-  std::map<const void *, std::vector<mlir::LLVM::AllocaOp>> Bufs;
+  std::map<const void *, std::vector<mlir::Value>> Bufs;
   std::map<int, mlir::Value> Constants;
   std::map<clang::LabelStmt *, mlir::Block *> Labels;
   const clang::FunctionDecl *EmittingFunctionDecl;
@@ -290,8 +290,8 @@ private:
   mlir::Value SYCLCommonFieldLookup(mlir::Value V, size_t FNum,
                                     llvm::ArrayRef<int64_t> Shape);
 
-  mlir::LLVM::AllocaOp allocateBuffer(size_t I, mlir::LLVM::LLVMPointerType T,
-                                      mlir::Type ElemTy) {
+  mlir::Value allocateBuffer(size_t I, mlir::LLVM::LLVMPointerType T,
+                             mlir::Type ElemTy) {
     auto &Vec = Bufs[T.getAsOpaquePointer()];
     if (I < Vec.size())
       return Vec[I];
@@ -299,10 +299,22 @@ private:
     mlir::OpBuilder Subbuilder(Builder.getContext());
     Subbuilder.setInsertionPointToStart(AllocationScope);
 
+    unsigned AllocaAS =
+        Glob.getCGM().getDataLayout().getAllocaAddrSpace();
+    mlir::LLVM::LLVMPointerType StorageTy =
+        (T.getAddressSpace() == AllocaAS)
+            ? T
+            : Glob.getTypes().getPointerType(ElemTy, AllocaAS);
+
     auto One = Subbuilder.create<mlir::arith::ConstantIntOp>(Loc, 1, 64);
-    auto Rs = Subbuilder.create<mlir::LLVM::AllocaOp>(Loc, T, ElemTy, One, 0);
-    Vec.push_back(Rs);
-    return Rs;
+    auto Rs =
+        Subbuilder.create<mlir::LLVM::AllocaOp>(Loc, StorageTy, ElemTy, One, 0);
+    mlir::Value Result = Rs.getResult();
+    if (StorageTy != T)
+      Result =
+          Subbuilder.create<mlir::LLVM::AddrSpaceCastOp>(Loc, T, Result);
+    Vec.push_back(Result);
+    return Result;
   }
 
   mlir::Location getMLIRLocation(clang::SourceLocation Loc);

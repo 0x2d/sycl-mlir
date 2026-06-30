@@ -164,12 +164,13 @@ ValueCategory MLIRScanner::callHelper(
   const auto &RetAI = CalleeInfo.getReturnInfo();
   const bool IsSRet =
       (RetAI.getKind() == clang::CodeGen::ABIArgInfo::Indirect);
+  mlirclang::CodeGen::ClangToLLVMArgMapping ArgMapping(
+      Glob.getCGM().getContext(), CalleeInfo, /*OnlyRequiredArgs=*/true,
+      Glob.getTypes());
   unsigned SRetArgNo = 0;
   if (IsSRet) {
-    mlirclang::CodeGen::ClangToLLVMArgMapping Mapping(
-        Glob.getCGM().getContext(), CalleeInfo, /*OnlyRequiredArgs=*/true);
-    assert(Mapping.hasSRetArg() && "Indirect return without sret arg");
-    SRetArgNo = Mapping.getSRetArgNo();
+    assert(ArgMapping.hasSRetArg() && "Indirect return without sret arg");
+    SRetArgNo = ArgMapping.getSRetArgNo();
   }
 
   size_t I = 0;
@@ -188,12 +189,23 @@ ValueCategory MLIRScanner::callHelper(
     });
     assert(Arg.val && "expect not null");
 
+    // No IR argument corresponds to a Clang argument with ABI Ignore.
+    if (CalleeArgs[I].info.getKind() == clang::CodeGen::ABIArgInfo::Ignore) {
+      ++I;
+      continue;
+    }
+
     if (auto *Ice = dyn_cast_or_null<clang::ImplicitCastExpr>(A))
       if (auto *Dre = dyn_cast<clang::DeclRefExpr>(Ice->getSubExpr()))
         MapFuncOperands.insert(
             make_pair(Dre->getDecl()->getName().str(), Arg.val));
 
-    if (I >= FnType.getInputs().size() || (I != 0 && A == nullptr)) {
+    if (Args.size() >= FnType.getInputs().size() ||
+        (I != 0 && A == nullptr)) {
+      mlir::emitError(Loc) << "cgeist: cannot lower call to '"
+                           << ToCall.getName()
+                           << "': source-level argument count exceeds MLIR "
+                              "function inputs";
       LLVM_DEBUG({
         Expr->dump();
         ToCall.dump();
@@ -201,7 +213,7 @@ ValueCategory MLIRScanner::callHelper(
         for (auto A : Arguments)
           std::get<1>(A)->dump();
       });
-      assert(false && "too many arguments in calls");
+      return ValueCategory();
     }
 
     bool IsReference =
@@ -346,6 +358,48 @@ ValueCategory MLIRScanner::callHelper(
       Val = castToMemSpaceOfType(Val, ExpectedType);
     }
     assert(Val);
+
+    // ABI-driven flattening: when CodeGenTypes flattened this aggregate into
+    // multiple MLIR scalar inputs, materialize Val into an alloca and load
+    // each field. Mirrors the Direct+canBeFlattened gate in
+    // CodeGenTypes::getFunctionType.
+    //
+    // Note: the scratch Slot lives in AllocaAS (e.g. AMDGPU private AS 5) and
+    // the GEP/Load happen in AllocaAS, while the callee-side prologue in
+    // MLIRScanner::init casts its Alloc back to flat (AS 0) before GEP/Store.
+    // The asymmetry is intentional: this slot is local to the call sequence,
+    // while the callee's slot is the parameter's stack slot, accessed by the
+    // function body in flat AS. Don't "normalize" one to match the other.
+    if (auto STy = dyn_cast<LLVM::LLVMStructType>(Val.getType())) {
+      auto [FirstIRArg, NumIRArgs] = ArgMapping.getIRArgs(I);
+      (void)FirstIRArg;
+      if (NumIRArgs > 1 &&
+          CalleeArgs[I].info.getKind() == clang::CodeGen::ABIArgInfo::Direct &&
+          CalleeArgs[I].info.getCanBeFlattened() &&
+          NumIRArgs == STy.getBody().size()) {
+        OpBuilder ABuilder(Builder.getContext());
+        ABuilder.setInsertionPointToStart(AllocationScope);
+        unsigned AllocaAS = Glob.getCGM().getDataLayout().getAllocaAddrSpace();
+        Type SlotPtrTy = Glob.getTypes().getPointerType(STy, AllocaAS);
+        Value Slot = ABuilder.create<LLVM::AllocaOp>(
+            Loc, SlotPtrTy, STy,
+            ABuilder.create<arith::ConstantIntOp>(Loc, 1, 64), 0);
+        ValueCategory(Slot, /*isRef*/ true, STy).store(Builder, Val);
+
+        for (unsigned K = 0, E = STy.getBody().size(); K != E; ++K) {
+          Type FieldTy = STy.getBody()[K];
+          Value GEP = Builder.create<LLVM::GEPOp>(
+              Loc, Glob.getTypes().getPointerType(FieldTy, AllocaAS), STy, Slot,
+              ValueRange({Builder.create<arith::ConstantIntOp>(Loc, 0, 32),
+                          Builder.create<arith::ConstantIntOp>(Loc, K, 32)}));
+          Value Loaded = Builder.create<LLVM::LoadOp>(Loc, FieldTy, GEP);
+          Args.push_back(Loaded);
+        }
+        I++;
+        continue;
+      }
+    }
+
     Args.push_back(Val);
     I++;
   }
@@ -1111,8 +1165,8 @@ ValueCategory MLIRScanner::VisitCallExpr(clang::CallExpr *Expr) {
             auto Idx = Counts[T.getAsOpaquePointer()]++;
             auto ElemTy = Toper.getSource().getType().getElementType();
             auto Aop = allocateBuffer(Idx, T, ElemTy);
-            Args.push_back(Aop.getResult());
-            Ops.emplace_back(Aop.getResult(), Toper.getSource(), ElemTy);
+            Args.push_back(Aop);
+            Ops.emplace_back(Aop, Toper.getSource(), ElemTy);
           } else
             Args.push_back(V);
         }

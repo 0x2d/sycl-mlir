@@ -62,9 +62,7 @@ static cl::opt<bool>
 /*            Flags affecting code generation of function types.              */
 /******************************************************************************/
 
-// Note: cgeist does not allow flattening struct function parameters. Need to
-// revisit.
-constexpr bool AllowStructFlattening = false;
+constexpr bool AllowStructFlattening = true;
 
 // Note: cgeist does not allow returning a struct via the parameter list. Need
 // to revisit.
@@ -256,15 +254,17 @@ namespace CodeGen {
 
 ClangToLLVMArgMapping::ClangToLLVMArgMapping(
     const clang::ASTContext &Context,
-    const clang::CodeGen::CGFunctionInfo &FI, bool OnlyRequiredArgs)
+    const clang::CodeGen::CGFunctionInfo &FI, bool OnlyRequiredArgs,
+    CodeGenTypes &Types)
     : InallocaArgNo(InvalidIndex), SRetArgNo(InvalidIndex), TotalIRArgs(0),
       ArgInfo(OnlyRequiredArgs ? FI.getNumRequiredArgs() : FI.arg_size()) {
-  construct(Context, FI, OnlyRequiredArgs);
+  construct(Context, FI, OnlyRequiredArgs, Types);
 }
 
 void ClangToLLVMArgMapping::construct(const clang::ASTContext &Context,
                                       const clang::CodeGen::CGFunctionInfo &FI,
-                                      bool OnlyRequiredArgs) {
+                                      bool OnlyRequiredArgs,
+                                      CodeGenTypes &Types) {
   unsigned IRArgNo = 0;
   bool SwapThisWithSRet = false;
   const clang::CodeGen::ABIArgInfo &RetAI = FI.getReturnInfo();
@@ -292,16 +292,20 @@ void ClangToLLVMArgMapping::construct(const clang::ASTContext &Context,
       // FIXME: handle sseregparm someday...
       llvm::StructType *STy = dyn_cast<llvm::StructType>(AI.getCoerceToType());
 
-      CGEIST_WARNING({
-        if (AI.isDirect() && AI.getCanBeFlattened() && STy)
-          llvm::WithColor::warning()
-              << "struct should be flattened but MLIR codegen "
-                 "cannot yet handle it. Needs to be fixed.\n";
-      });
-
       if (AllowStructFlattening && AI.isDirect() && AI.getCanBeFlattened() &&
           STy) {
-        IRArgs.NumberOfArgs = STy->getNumElements();
+        // Mirror the gate in CodeGenTypes::getFunctionType: only flatten when
+        // the MLIR-side aggregate is an LLVMStructType matching the LLVM
+        // CoerceToType field count. SYCL dialect types (e.g. !sycl.nd_item)
+        // stay as a single MLIR arg even when LLVM coerces the struct to N
+        // fields.
+        bool MLIRSideFlattenable = true;
+        mlir::Type MLIRArgTy = Types.getMLIRType(I->type);
+        auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(MLIRArgTy);
+        MLIRSideFlattenable =
+            ST && ST.getBody().size() == STy->getNumElements();
+        IRArgs.NumberOfArgs =
+            MLIRSideFlattenable ? STy->getNumElements() : 1;
       } else {
         IRArgs.NumberOfArgs = 1;
       }
@@ -403,7 +407,7 @@ CodeGenTypes::getFunctionType(const clang::CodeGen::CGFunctionInfo &FI,
   // Compute the type of the function return value.
   //
   const clang::CodeGen::ABIArgInfo &RetAI = FI.getReturnInfo();
-  ClangToLLVMArgMapping IRFunctionArgs(CGM.getContext(), FI, true);
+  ClangToLLVMArgMapping IRFunctionArgs(CGM.getContext(), FI, true, *this);
   mlir::OpBuilder Builder(TheModule->getContext());
   LLVM_DEBUG(llvm::dbgs() << "Processing return value\n");
 
@@ -546,16 +550,15 @@ CodeGenTypes::getFunctionType(const clang::CodeGen::CGFunctionInfo &FI,
       // do for this argument.
       auto ST = dyn_cast<mlir::LLVM::LLVMStructType>(MLIRArgTy);
 
-      CGEIST_WARNING({
-        if (ST && ArgInfo.isDirect() && ArgInfo.getCanBeFlattened())
-          llvm::WithColor::warning()
-              << "struct should be flattened but MLIR codegen "
-                 "cannot yet handle it. Needs to be fixed.\n";
-      });
-
+      // Only flatten when ClangToLLVMArgMapping (which inspects
+      // ArgInfo.getCoerceToType()) decided to produce >1 IR argument and the
+      // MLIR aggregate has a matching field count. ClangToLLVMArgMapping uses
+      // the LLVM CoerceToType, while MLIRArgTy is built from the declared
+      // C++ type, so the two can disagree (e.g. SysV coerces a small struct
+      // to i64, NumIRArgs == 1, but MLIRArgTy is still a 2-field LLVMStruct).
       if (AllowStructFlattening && ST && ArgInfo.isDirect() &&
-          ArgInfo.getCanBeFlattened()) {
-        assert(NumIRArgs == ST.getBody().size());
+          ArgInfo.getCanBeFlattened() && NumIRArgs > 1 &&
+          NumIRArgs == ST.getBody().size()) {
         for (unsigned I = 0, E = ST.getBody().size(); I != E; ++I)
           ArgTypes[FirstIRArg + I] = ST.getBody()[I];
       } else {
@@ -864,7 +867,7 @@ void CodeGenTypes::constructAttributeList(
   }
 
   // Collect attributes from arguments and return values.
-  ClangToLLVMArgMapping IRFunctionArgs(CGM.getContext(), FI);
+  ClangToLLVMArgMapping IRFunctionArgs(CGM.getContext(), FI, false, *this);
 
   QualType RetTy = FI.getReturnType();
   const clang::CodeGen::ABIArgInfo &RetAI = FI.getReturnInfo();

@@ -55,6 +55,8 @@ class LLVMPointerType;
 namespace mlirclang {
 namespace CodeGen {
 
+class CodeGenTypes;
+
 /// Encapsulates information about the way function arguments from
 /// CGFunctionInfo should be passed to actual LLVM IR function.
 class ClangToLLVMArgMapping {
@@ -79,9 +81,16 @@ class ClangToLLVMArgMapping {
   llvm::SmallVector<IRArgs, 8> ArgInfo;
 
 public:
+  /// Construct an argument mapping for `FI`. `Types` must be non-null: the
+  /// mapping consults `Types->getMLIRType(...)` for each argument and demotes
+  /// the IR-arg count to 1 when the MLIR-side aggregate is not a flattenable
+  /// `LLVMStructType` matching the LLVM CoerceToType field count (e.g. SYCL
+  /// dialect types, or SysV i64-coerced structs). Skipping this consultation
+  /// would silently re-introduce the callsite/signature mismatch this mapping
+  /// exists to prevent.
   ClangToLLVMArgMapping(const clang::ASTContext &Context,
                         const clang::CodeGen::CGFunctionInfo &FI,
-                        bool OnlyRequiredArgs = false);
+                        bool OnlyRequiredArgs, CodeGenTypes &Types);
 
   bool hasInallocaArg() const { return InallocaArgNo != InvalidIndex; }
   unsigned getInallocaArgNo() const {
@@ -117,7 +126,7 @@ public:
 private:
   void construct(const clang::ASTContext &Context,
                  const clang::CodeGen::CGFunctionInfo &FI,
-                 bool OnlyRequiredArgs);
+                 bool OnlyRequiredArgs, CodeGenTypes &Types);
 };
 
 /// This class organizes the cross-module state that is used while lowering

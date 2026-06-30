@@ -106,10 +106,11 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
   const clang::CodeGen::CGFunctionInfo &FI = Glob.getOrCreateCGFunctionInfo(FD);
   IsSRet =
       (FI.getReturnInfo().getKind() == clang::CodeGen::ABIArgInfo::Indirect);
+  mlirclang::CodeGen::ClangToLLVMArgMapping Mapping(
+      Glob.getCGM().getContext(), FI, /*OnlyRequiredArgs=*/true,
+      Glob.getTypes());
   unsigned SRetArgNo = ~0U;
   if (IsSRet) {
-    mlirclang::CodeGen::ClangToLLVMArgMapping Mapping(
-        Glob.getCGM().getContext(), FI, /*OnlyRequiredArgs=*/true);
     SRetArgNo = Mapping.getSRetArgNo();
     SRetArg = Function.getArgument(SRetArgNo);
   }
@@ -156,6 +157,40 @@ void MLIRScanner::init(FunctionOpInterface Func, const FunctionToEmit &FTE) {
     }
 
     clang::QualType ParmType = Parm->getType();
+
+    // Symmetric counterpart of CGCall.cc:362-394 caller-side flatten loop.
+    // When AMDGPU ABI flattened an aggregate clang formal into N IR args
+    // and the MLIR-side type is the matching LLVMStructType, store each
+    // flattened IR arg into its field slot via GEP. We use field-wise GEP
+    // stores (rather than llvm.insertvalue + whole-struct store) because
+    // the struct's fields can be SYCL dialect types (e.g. h_item<1> has
+    // body (!sycl.item, !sycl.item, !sycl.item)) and llvm.insertvalue
+    // requires primitive LLVM operands.
+    mlir::Type FullMLIRTy = Glob.getTypes().getMLIRType(ParmType);
+    if (auto STy = dyn_cast<LLVM::LLVMStructType>(FullMLIRTy)) {
+      auto [FirstIRArg, NumIRArgs] = Mapping.getIRArgs(I);
+      if (NumIRArgs > 1 &&
+          FIArgs[I].info.getKind() == clang::CodeGen::ABIArgInfo::Direct &&
+          FIArgs[I].info.getCanBeFlattened() &&
+          NumIRArgs == STy.getBody().size()) {
+        Value Alloc = createAllocOp(STy, Parm, /*MemSpace=*/0,
+                                    /*IsArray=*/false, /*LLVMABI=*/true);
+        for (unsigned K = 0; K < NumIRArgs; ++K) {
+          Value Field = Function.getArgument(FirstIRArg + K);
+          Type FieldTy = STy.getBody()[K];
+          Value GEP = Builder.create<LLVM::GEPOp>(
+              Loc, Glob.getTypes().getPointerType(FieldTy, /*AS=*/0), STy,
+              Alloc,
+              ValueRange({Builder.create<arith::ConstantIntOp>(Loc, 0, 32),
+                          Builder.create<arith::ConstantIntOp>(Loc, K, 32)}));
+          Builder.create<LLVM::StoreOp>(Loc, Field, GEP);
+        }
+        IRIdx = FirstIRArg + NumIRArgs;
+        MaybeSkipSRet();
+        ++I;
+        continue;
+      }
+    }
 
     bool LLVMABI = false, IsArray = false;
     if (isa<LLVM::LLVMPointerType>(Glob.getTypes().getMLIRType(
@@ -416,28 +451,43 @@ Value MLIRScanner::createAllocOp(Type T, clang::VarDecl *Name,
 
   if (!IsArray) {
     if (LLVMABI) {
+      unsigned AllocaAS = Glob.getCGM().getDataLayout().getAllocaAddrSpace();
+      unsigned StorageAS = (MemSpace == 0) ? AllocaAS : MemSpace;
+
       if (Name)
         if (const auto *Var = dyn_cast<clang::VariableArrayType>(
                 Name->getType()->getUnqualifiedDesugaredType())) {
           auto Len = Visit(Var->getSizeExpr()).getValue(Builder);
-          Alloc = Builder.create<LLVM::AllocaOp>(
-              VarLoc, Glob.getTypes().getPointerType(T, MemSpace), T, Len);
-          Builder.create<polygeist::TrivialUseOp>(VarLoc, Alloc);
+          Value RawAlloc = Builder.create<LLVM::AllocaOp>(
+              VarLoc, Glob.getTypes().getPointerType(T, StorageAS), T, Len);
+          Builder.create<polygeist::TrivialUseOp>(VarLoc, RawAlloc);
+          if (StorageAS != MemSpace)
+            Alloc = Builder.create<LLVM::AddrSpaceCastOp>(
+                VarLoc, Glob.getTypes().getPointerType(T, MemSpace), RawAlloc);
+          else
+            Alloc = RawAlloc;
         }
 
       if (!Alloc) {
-        Alloc = ABuilder.create<LLVM::AllocaOp>(
-            VarLoc, Glob.getTypes().getPointerType(T, MemSpace), T,
+        Value RawAlloc = ABuilder.create<LLVM::AllocaOp>(
+            VarLoc, Glob.getTypes().getPointerType(T, StorageAS), T,
             ABuilder.create<arith::ConstantIntOp>(VarLoc, 1, 64), 0);
         if (isa<IntegerType, FloatType>(T)) {
           ABuilder.create<LLVM::StoreOp>(
               VarLoc, ValueCategory::getUndefValue(ABuilder, VarLoc, T).val,
-              Alloc);
+              RawAlloc);
         }
+        if (StorageAS != MemSpace)
+          Alloc = ABuilder.create<LLVM::AddrSpaceCastOp>(
+              VarLoc, Glob.getTypes().getPointerType(T, MemSpace), RawAlloc);
+        else
+          Alloc = RawAlloc;
       }
       ElemTy = T;
     } else {
-      MR = MemRefType::get(1, T, {}, MemSpace);
+      unsigned AllocaAS = Glob.getCGM().getDataLayout().getAllocaAddrSpace();
+      unsigned StorageAS = (MemSpace == 0) ? AllocaAS : MemSpace;
+      MR = MemRefType::get(1, T, {}, StorageAS);
       Alloc = ABuilder.create<memref::AllocaOp>(VarLoc, MR);
       ElemTy = T;
       LLVM_DEBUG({
@@ -455,6 +505,17 @@ Value MLIRScanner::createAllocOp(Type T, clang::VarDecl *Name,
         Alloc = ABuilder.create<polygeist::Pointer2MemrefOp>(
             VarLoc, MemRefType::get(ShapedType::kDynamic, T, {}, MemSpace),
             MemRefToPtr);
+      } else if (StorageAS != MemSpace) {
+        // Target alloca AS differs from flat AS (e.g. AMDGPU private AS 5);
+        // bridge back so the LLVM::AllocaOp lands in StorageAS and the
+        // resulting memref stays in flat AS the caller expects.
+        auto PtrInStorage = ABuilder.create<polygeist::Memref2PointerOp>(
+            VarLoc, Glob.getTypes().getPointerType(T, StorageAS), Alloc);
+        auto PtrInFlat = ABuilder.create<LLVM::AddrSpaceCastOp>(
+            VarLoc, Glob.getTypes().getPointerType(T, MemSpace), PtrInStorage);
+        Alloc = ABuilder.create<polygeist::Pointer2MemrefOp>(
+            VarLoc, MemRefType::get(ShapedType::kDynamic, T, {}, MemSpace),
+            PtrInFlat);
       }
       Alloc = ABuilder.create<memref::CastOp>(
           VarLoc, MemRefType::get(ShapedType::kDynamic, T, {}, 0), Alloc);
@@ -474,6 +535,8 @@ Value MLIRScanner::createAllocOp(Type T, clang::VarDecl *Name,
     auto MT = cast<MemRefType>(T);
     auto Shape = std::vector<int64_t>(MT.getShape());
     auto PShape = Shape[0];
+    unsigned AllocaAS = Glob.getCGM().getDataLayout().getAllocaAddrSpace();
+    unsigned StorageAS = (MemSpace == 0) ? AllocaAS : MemSpace;
 
     if (Name)
       if (const auto *Var = dyn_cast<clang::VariableArrayType>(
@@ -481,19 +544,24 @@ Value MLIRScanner::createAllocOp(Type T, clang::VarDecl *Name,
         assert(Shape[0] == ShapedType::kDynamic);
         MR = MemRefType::get(
             Shape, MT.getElementType(), MemRefLayoutAttrInterface(),
-            mlirclang::wrapIntegerMemorySpace(MemSpace, MT.getContext()));
+            mlirclang::wrapIntegerMemorySpace(StorageAS, MT.getContext()));
         auto Len = Visit(Var->getSizeExpr()).getValue(Builder);
         Len = Builder.create<arith::IndexCastOp>(VarLoc, Builder.getIndexType(),
                                                  Len);
         Alloc = Builder.create<memref::AllocaOp>(VarLoc, MR, Len);
         Builder.create<polygeist::TrivialUseOp>(VarLoc, Alloc);
-        if (MemSpace != 0)
+        if (StorageAS != MemSpace) {
+          auto PtrInStorage = ABuilder.create<polygeist::Memref2PointerOp>(
+              VarLoc,
+              Glob.getTypes().getPointerType(MT.getElementType(), StorageAS),
+              Alloc);
+          auto PtrInFlat = ABuilder.create<LLVM::AddrSpaceCastOp>(
+              VarLoc,
+              Glob.getTypes().getPointerType(MT.getElementType(), MemSpace),
+              PtrInStorage);
           Alloc = ABuilder.create<polygeist::Pointer2MemrefOp>(
-              VarLoc, MemRefType::get(Shape, MT.getElementType()),
-              ABuilder.create<polygeist::Memref2PointerOp>(
-                  VarLoc,
-                  Glob.getTypes().getPointerType(MT.getElementType(), 0),
-                  Alloc));
+              VarLoc, MemRefType::get(Shape, MT.getElementType()), PtrInFlat);
+        }
       }
 
     if (!Alloc) {
@@ -501,14 +569,20 @@ Value MLIRScanner::createAllocOp(Type T, clang::VarDecl *Name,
         Shape[0] = 1;
       MR = MemRefType::get(
           Shape, MT.getElementType(), MemRefLayoutAttrInterface(),
-          mlirclang::wrapIntegerMemorySpace(MemSpace, MT.getContext()));
+          mlirclang::wrapIntegerMemorySpace(StorageAS, MT.getContext()));
       Alloc = ABuilder.create<memref::AllocaOp>(VarLoc, MR);
-      if (MemSpace != 0)
+      if (StorageAS != MemSpace) {
+        auto PtrInStorage = ABuilder.create<polygeist::Memref2PointerOp>(
+            VarLoc,
+            Glob.getTypes().getPointerType(MT.getElementType(), StorageAS),
+            Alloc);
+        auto PtrInFlat = ABuilder.create<LLVM::AddrSpaceCastOp>(
+            VarLoc,
+            Glob.getTypes().getPointerType(MT.getElementType(), MemSpace),
+            PtrInStorage);
         Alloc = ABuilder.create<polygeist::Pointer2MemrefOp>(
-            VarLoc, MemRefType::get(Shape, MT.getElementType()),
-            ABuilder.create<polygeist::Memref2PointerOp>(
-                VarLoc, Glob.getTypes().getPointerType(MT.getElementType(), 0),
-                Alloc));
+            VarLoc, MemRefType::get(Shape, MT.getElementType()), PtrInFlat);
+      }
 
       Shape[0] = PShape;
       Alloc = ABuilder.create<memref::CastOp>(
