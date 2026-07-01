@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import sys
+import argparse
+import tempfile
+import traceback
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+toolchain = ""
+targets = ["athread", "openmp"]
+log_levels = ["status", "info", "warning", "error"]
+
+log_level = 3
+print_cmds = False
+DEBUG_MODE = not (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'))
+
+# @llvm.global_ctors = appending global [1 x { i32, void ()*, i8* }] [{ i32, void ()*, i8* } { i32 65535, void ()* @__sw_sycl_descriptor_reg, i8* null }]
+register_ir = '''
+define void @__swcl_sycl_descriptor_reg() {
+entry:
+call void @__sycl_register_lib(%__tgt_bin_desc* @.sycl_offloading.descriptor)
+ret void
+}
+declare void @__sycl_register_lib(%__tgt_bin_desc*)
+'''
+
+register_c = '''
+extern void __swcl_sycl_descriptor_reg();
+void __attribute__((constructor)) __swcl_sycl_descriptor_reg_constructor() {
+    __swcl_sycl_descriptor_reg();
+}
+'''
+
+empty_spv = b'\x03\x02#\x07\x00\x00\x01\x00\x0e\x00\x06\x00\x02\x00\x00\x00\x00\x00\x00\x00\x11\x00\x02\x00\x04\x00\x00\x00\x11\x00\x02\x00\x05\x00\x00\x00\x11\x00\x02\x00\x06\x00\x00\x00\x0b\x00\x05\x00\x01\x00\x00\x00OpenCL.std\x00\x00\x0e\x00\x03\x00\x02\x00\x00\x00\x02\x00\x00\x00\x03\x00\x03\x00\x03\x00\x00\x00\xe0\x93\x04\x00'
+
+
+def get_log_level_number(level):
+    for i, l in enumerate(log_levels):
+        if l == level:
+            return i
+    return log_level
+
+
+def log(level, msg):
+    if isinstance(level, str):
+        level = get_log_level_number(level)
+    if level >= log_level:
+        if level > 2:
+            print(msg, file=sys.stderr)
+        else:
+            print(msg)
+
+
+def system_run(cmd, input=""):
+    global print_cmds
+    if print_cmds:
+        print(cmd)
+    process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+    output, error = process.communicate(input=input.encode())
+    output = output.decode()
+    error = error.decode()
+    return_code = process.returncode
+    if log_level <= 0:
+        print()
+        print(output)
+    if return_code != 0:
+        if DEBUG_MODE:
+            print(file=sys.stderr)
+            print(cmd, file=sys.stderr)
+            print(file=sys.stderr)
+        print(error, file=sys.stderr, end="")
+        if DEBUG_MODE:
+            print(file=sys.stderr)
+            traceback.print_stack()
+        sys.exit(1)
+    return output, error, return_code
+
+
+def join_cmds(args):
+    return " ".join([f'"{arg}"' for arg in args])
+
+
+def join_with_escape(args):
+    args = [re.sub(r'([\\"])', r'\\\1', arg) for arg in args]
+    return " ".join([f'"{arg}"' for arg in args])
+
+
+def split_cmd(cmd):
+    cmd_parts = re.findall(r'(?<!\\)".*?(?<!\\)"', cmd)
+    cmd_parts = [part[1:-1] for part in cmd_parts]
+    return cmd_parts[0], cmd_parts[1:]
+
+
+def get_target_triple(clang):
+    triple, _, _ = system_run(f"{clang} --print-target-triple")
+    triple = triple.strip()
+    return triple
+
+
+def get_gcc_toolchain():
+    gcc_toolchain, _, _ = system_run(f"echo $(dirname $(dirname $(which gcc)))")
+    gcc_toolchain = gcc_toolchain.strip()
+    return gcc_toolchain
+
+
+def separate_options_inputs_and_output(cxx_opt):
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/clang++", "-fsycl"]
+    cmd += cxx_opt
+    cmd += ["-fno-sycl-instrument-device-code", "-fno-sycl-device-lib=all"]
+    cmd += [f"--gcc-toolchain={get_gcc_toolchain()}"]
+    cmd += ["-###"]
+    cmd = ' '.join(['"{}"'.format(arg.replace('"', '\\"')) for arg in cmd])
+    _, cmds, _ = system_run(cmd)
+    cmds = [cmd for cmd in cmds.splitlines() if cmd.startswith(' "')]
+    inputs = []
+    for cmd in cmds:
+        exe, args = split_cmd(cmd)
+        exe_base = os.path.basename(exe)
+        if exe_base == "clang-18" and args[0] == "-cc1" and "-fsycl-is-device" in args:
+            input = args[-1]
+            if input in cxx_opt:
+                inputs.append(input)
+        elif exe_base == "clang-offload-bundler" and "-unbundle" in args:
+            prefix = "-input="
+            for arg in args:
+                if arg.startswith(prefix):
+                    input = arg[len(prefix):]
+                    if input in cxx_opt:
+                        inputs.append(input)
+                    break
+    options = []
+    output = None
+    is_output = False
+    for opt in cxx_opt:
+        if is_output:
+            output = opt
+            is_output = False
+        elif opt.startswith('-o'):
+            if opt == '-o':
+                is_output = True
+            else:
+                output = opt[2:]
+        elif opt not in inputs:
+            options.append(opt)
+    return options, inputs, output
+
+
+def generate_commands_flow(target, cxx, cxx_opt, inputs, sycl_output, use_dpcpp):
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/clang++", "-fsycl"]
+    cmd += cxx_opt
+    if not use_dpcpp:
+        host_cxx_opts = ['-std=c++17']
+        host_cxx_opts += [opt for opt in cxx_opt if opt != "-c"]
+        if target == "openmp":
+            host_cxx_opts += [f"--gcc-toolchain={get_gcc_toolchain()}"]
+        cmd += [f"-fsycl-host-compiler={cxx}"]
+        cmd += [f"-fsycl-host-compiler-options= {join_with_escape(host_cxx_opts)}"]
+    cmd += inputs
+    if sycl_output:
+        cmd += ["-o", sycl_output]
+    cmd += ["-fno-sycl-instrument-device-code", "-fno-sycl-device-lib=all"]
+    cmd += [f"--gcc-toolchain={get_gcc_toolchain()}"]
+    cmd += ["-###"]
+    cmd = join_with_escape(cmd)
+    _, cmds, _ = system_run(cmd)
+    cmds = [cmd for cmd in cmds.splitlines() if cmd.startswith(' "')]
+    cmds_normal = []
+    cmds_depfile = []
+    for cmd in cmds:
+        _, args = split_cmd(cmd)
+        if "-E" in args and "-MD" in args:
+            cmds_depfile.append(cmd)
+        else:
+            cmds_normal.append(cmd)
+    return cmds_normal + cmds_depfile
+
+
+def make_wrapper_v13_compatible(input, file_map):
+    origin_input = input
+    outname = os.path.splitext(input)[0]
+    output = f"{outname}.spir64.ll"
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/opt"]
+    cmd += ["-mtriple=spir64-unknown-unknown", "-S", input, "-o", output]
+    system_run(join_with_escape(cmd))
+    with open(output, "r") as f:
+        lines = f.readlines()
+    null_syms = []
+    new_lines = []
+    for line in lines:
+        if "[0 x %__tgt_offload_entry]" in line:
+            null_syms.append(line.split("=")[0].strip() + ",")
+        else:
+            for sym in null_syms:
+                line = line.replace(sym, "null,")
+            new_lines.append(line)
+    with open(output, "w") as f:
+        f.writelines(new_lines)
+    input = output
+    output = f"{outname}.spir64.bc"
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/llvm-as"]
+    cmd += [input, "-o", output]
+    system_run(join_with_escape(cmd))
+    input = output
+    output = f"{outname}.spv"
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/llvm-spirv"]
+    cmd += [input, "-o", output]
+    system_run(join_with_escape(cmd))
+    cmd = [f"{toolchain}/lib/swcl/intel-llvm/bin/llvm-dis", input]
+    system_run(join_with_escape(cmd))
+    input = output
+    output = f"{outname}.13.bc"
+    cmd = [f"{toolchain}/bin/llvm-spirv"]
+    cmd += ["-r", input, "-o", output]
+    system_run(join_with_escape(cmd))
+    input = output
+    output = f"{outname}.13.ll"
+    cmd = [f"{toolchain}/bin/llvm-dis", input, "-o", output]
+    system_run(join_with_escape(cmd))
+    with open(output, "a") as ir:
+        ir.write(register_ir)
+    for k, v in file_map.items():
+        if origin_input == v:
+            file_map[k] = output
+
+
+class SWSYCLDriver:
+    def __init__(self, driver_opt) -> None:
+        self.file_map = {}
+        self.target = driver_opt.target
+        self.temp_dir = Path(driver_opt.temp_dir)
+        self.use_dpcpp = driver_opt.use_dpcpp
+        self.cxx = f"{toolchain}/bin/clang++"
+        self.llc = f"{toolchain}/bin/llc"
+        self.clang = f"{toolchain}/bin/clang"
+        if self.target == "athread":
+            self.cxx = "swg++"
+            self.llc = "llc"
+            self.clang = "clang"
+
+    def compile_sycl(self, sycl_opt):
+        target = self.target
+        temp_dir = self.temp_dir
+        use_dpcpp = self.use_dpcpp
+        cxx = self.cxx
+        llc = self.llc
+        clang = self.clang
+        sycl_opt = sycl_opt + ["-Xclang", "-fsycl-disable-range-rounding"]
+        if not any(opt.startswith("-ffp-contract=") for opt in sycl_opt):
+            sycl_opt = sycl_opt + ["-ffp-contract=off"]
+        cxx_opt, inputs, sycl_output = separate_options_inputs_and_output(sycl_opt)
+        cmd_flow = generate_commands_flow(target, cxx, cxx_opt, inputs, sycl_output, use_dpcpp)
+        file_map = self.file_map
+        lib_swcl_kernel = str(temp_dir / "libSWCLKernel.a")
+        link_args_file = lib_swcl_kernel + ".link_args.txt"
+        cgeist = "/home/oyyc/sycl-mlir/build/install/bin/cgeist"
+        cgeist_root = os.path.dirname(os.path.dirname(cgeist))
+        intel_llvm_root = f"{toolchain}/lib/swcl/intel-llvm"
+        for idx, cmd in enumerate(cmd_flow):
+            exe, args = split_cmd(cmd)
+            exe_base = os.path.basename(exe)
+            # 1. Compile device C++ source to LLVM bitcode via cgeist.
+            if exe_base.startswith("clang-") and "-cc1" in args and "-fsycl-is-device" in args:
+                source = args[-1]
+                out_pos = args.index("-o")
+                output = args[out_pos + 1]
+                new_args = []
+                i = 0
+                while i < len(args):
+                    arg = args[i].replace(intel_llvm_root, cgeist_root)
+                    if (arg == "-triple" and i + 1 < len(args)
+                            and args[i + 1] == "spir64-unknown-unknown"):
+                        new_args += ["-triple", "spir64-unknown-unknown-syclmlir"]
+                        i += 2
+                    else:
+                        new_args.append(arg)
+                        i += 1
+                cgeist_args = ["-emit-llvm", source, "-o", output, "--args"] + new_args
+                outputs = self.run_with_file_mapped(idx, cgeist, cgeist_args)
+            # 3. Convert LLVM bitcode to SPIRV.
+            elif exe_base == "llvm-foreach":
+                args = [f"--out-dir={temp_dir}"] + args
+                il_inputs_file = self.run_with_file_mapped(idx, exe, args)[0]
+                # 7. Compile SPIRV files into libSWCLKernel.
+                with open(il_inputs_file, "r") as f:
+                    il_inputs = [line.strip() for line in f]
+                cmd = [f"{toolchain}/bin/swcl"]
+                if DEBUG_MODE:
+                    cmd += [f"--target={target}", f"--save-temps={temp_dir}", "--static-lib"]
+                cmd += il_inputs
+                cmd += ["-o", f"{lib_swcl_kernel}"]
+                system_run(join_cmds(cmd))
+                wrapper_inputs = []
+                for il_input in il_inputs:
+                    wrapper_input = il_input + ".empty.spv"
+                    with open(wrapper_input, "wb") as f:
+                        f.write(empty_spv)
+                    wrapper_inputs += [wrapper_input + "\n"]
+                with open(il_inputs_file, "w") as f:
+                    f.writelines(wrapper_inputs)
+            # 4.2 Compile wrapper bitcode to object.
+            elif exe_base == "llc" and "-filetype=obj" in args:
+                if not use_dpcpp and target == "athread":
+                    exe = clang
+                    args = ["-c" if arg == "-filetype=obj" else arg for arg in args]
+                elif not use_dpcpp:
+                    exe = llc
+                    args = [f"-mtriple={get_target_triple(clang)}", "-relocation-model=pic"] + args
+                output = self.run_with_file_mapped(idx, exe, args)[0]
+            # 6. Link host objects and wrapper object.
+            elif exe_base == "ld":
+                if use_dpcpp:
+                    self.run_with_file_mapped(idx, exe, args)
+                else:
+                    output = str(temp_dir / f"wrapper.register.{idx}.o")
+                    cmd = f"{cxx} -x c -c -o {output} -"
+                    system_run(cmd, register_c)
+                    register_obj = output
+                    cmd = [cxx]
+                    if target == "athread":
+                        cmd += ["-mdynamic"]
+                    else:
+                        cmd += ["-fopenmp=libgomp"]
+                        cmd += [f"--gcc-toolchain={get_gcc_toolchain()}"]
+                    cmd += cxx_opt
+                    self.replace_sycl_disable_range_rounding(cmd)
+                    for arg in args:
+                        if arg in file_map:
+                            cmd += [file_map[arg]]
+                    cmd += [register_obj]
+                    with open(link_args_file, "r") as f:
+                        cmd += [arg.strip() for arg in f.readlines()]
+                    cmd += ["-L", f"{toolchain}/lib/swcl/{target}/lib", "-lsycl", "-lstdc++"]
+                    if sycl_output:
+                        cmd += ["-o", sycl_output]
+                    system_run(join_with_escape(cmd))
+            elif "-E" in args and "-MD" in args:
+                remove_args_idx = []
+                for idx, arg in enumerate(args):
+                    if "-include" == arg and idx + 1 < len(args):
+                        if args[idx + 1] in file_map:
+                            # TODO: Remove it from the -MF output.d, not in argument.
+                            remove_args_idx += [idx, idx + 1]
+                    elif "-o" == arg:
+                        remove_args_idx += [idx, idx + 1]
+                args = [arg for idx, arg in enumerate(args) if idx not in remove_args_idx]
+                self.replace_sycl_disable_range_rounding(args)
+                outputs = self.run_with_file_mapped(idx, exe, args)
+            else:
+                self.replace_sycl_disable_range_rounding(args)
+                outputs = self.run_with_file_mapped(idx, exe, args)
+                # 4.1 Generate wrapper bitcode.
+                if not use_dpcpp and exe_base == "clang-offload-wrapper" and "-kind=sycl" in args:
+                    make_wrapper_v13_compatible(outputs[0], file_map)
+        if sycl_output in self.file_map:
+            system_run(f"mv {self.file_map[sycl_output]} {sycl_output}")
+
+    def replace_sycl_disable_range_rounding(self, cxx_opt):
+        i = 0
+        while i < len(cxx_opt) - 1:
+            if cxx_opt[i] == "-Xclang" and cxx_opt[i + 1] == "-fsycl-disable-range-rounding":
+                cxx_opt[i] = "-D"
+                cxx_opt[i + 1] = "__SYCL_DISABLE_PARALLEL_FOR_RANGE_ROUNDING__=1"
+                return
+            else:
+                i += 1
+        return
+
+    def run_with_file_mapped(self, idx, exe, args):
+        outputs = self.map_file_in_args(idx, args)
+        system_run(join_cmds([exe] + args))
+        return outputs
+
+    def map_file_in_args(self, seq, args):
+        file_map = self.file_map
+        temp_dir = self.temp_dir
+        outputs = []
+        input_prefixs = ["-input="]
+        input_prefixs += ["--in-file-list=", "--in-replace=", "--append="]
+        input_prefixs += [""]
+        output_prefixs = ["-fsycl-int-header=", "-fsycl-int-footer="]
+        output_prefixs += ["-o=", "-output=", "--output=", "--out-file-list=", "--out-replace="]
+        output_prefixs += [""]
+
+        def map_output(idx, offset=0):
+            origin = args[idx][offset:]
+            output = Path(origin)
+            if not output.is_absolute():
+                return
+            output = str(temp_dir / f"{output.stem}.{seq:02d}{output.suffix}")
+            file_map[origin] = output
+            args[idx] = args[idx][:offset] + output
+            outputs.append(output)
+
+        for idx, arg in enumerate(args):
+            if arg in file_map:
+                args[idx] = file_map[arg]
+            elif prefix := next(p for p in input_prefixs if arg.startswith(p)):
+                input = arg[len(prefix):]
+                if input in file_map:
+                    args[idx] = prefix + file_map[input]
+            elif arg == "-o" and idx + 1 < len(args):
+                map_output(idx + 1)
+            elif prefix := next(p for p in output_prefixs if arg.startswith(p)):
+                map_output(idx, len(prefix))
+
+        return outputs
+
+
+def compile_default(driver_opt, sycl_opt):
+    target = driver_opt.target
+    save_temps = driver_opt.save_temps
+    if target == "athread":
+        cxx = "swg++"
+    else:
+        cxx = f"{toolchain}/bin/clang++"
+        sycl_opt += [f"--gcc-toolchain={get_gcc_toolchain()}"]
+    cmd = [cxx]
+    cmd += sycl_opt
+    if save_temps != "none":
+        cmd += [f"-save-temps={save_temps}"]
+    print(join_with_escape(cmd))
+    system_run(join_with_escape(cmd))
+
+
+def compile_proxy(driver_opt, sycl_opt):
+    if "-march=native" in sycl_opt:
+        sycl_opt.remove("-march=native")
+    if "-fsycl" in sycl_opt:
+        sycl_opt.remove("-fsycl")
+        driver = SWSYCLDriver(driver_opt)
+        driver.compile_sycl(sycl_opt)
+    else:
+        compile_default(driver_opt, sycl_opt)
+
+
+def main():
+    global toolchain
+    exeutable = sys.argv[0] if DEBUG_MODE else sys.executable
+    toolchain = os.path.abspath(os.path.join(os.path.dirname(exeutable), os.path.pardir))
+
+    parser = argparse.ArgumentParser(description="ICT SYCL compiler.", add_help=DEBUG_MODE)
+    class SYCLHelpAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            try:
+                output, _, _ = system_run(f"{toolchain}/lib/swcl/intel-llvm/bin/clang++ --help")
+                print(output, end="", flush=True)
+            finally:
+                sys.exit(0)
+    if not DEBUG_MODE:
+        parser.add_argument("-h", "--help", nargs=0, action=SYCLHelpAction)
+    if DEBUG_MODE:
+        parser.add_argument("-h2", "--help2", nargs=0, action=SYCLHelpAction, help="show help message of sycl compiler.")
+        parser.add_argument("--target", choices=targets, default="openmp", help="Target for compilation.")
+        parser.add_argument("--use-dpcpp", action='store_true', help="Use pure dpcpp compilation command.")
+        parser.add_argument("--log-level", choices=log_levels, default="error", help="Log level of compilation.")
+        parser.add_argument('--save-temps', type=str, nargs='?', default="none", help='Save intermediate results.')
+        parser.add_argument('--save-temps-dir', type=str, default=".swsycl", help='Directory to save intermediate results.')
+        parser.add_argument("--print-cmds", action='store_true', help="Print all compilation commands.")
+    args, sycl_opt = parser.parse_known_args()
+
+    if DEBUG_MODE:
+        global print_cmds
+        print_cmds = args.print_cmds
+        global log_level
+        log_level = get_log_level_number(args.log_level)
+
+    driver_opt = SimpleNamespace()
+    driver_opt.target = "athread"
+    driver_opt.use_dpcpp = False
+    driver_opt.save_temps = "none"
+    if DEBUG_MODE:
+        driver_opt.target = args.target
+        driver_opt.use_dpcpp = args.use_dpcpp
+        driver_opt.save_temps = args.save_temps
+
+    auto_temp_dir = tempfile.TemporaryDirectory()
+    if not driver_opt.save_temps or driver_opt.save_temps == "sycl":
+        driver_opt.temp_dir = str(Path(args.save_temps_dir).absolute())
+        system_run(f"mkdir -p {driver_opt.temp_dir}")
+    else:
+        driver_opt.temp_dir = auto_temp_dir.name
+
+    compile_proxy(driver_opt, sycl_opt)
+
+    auto_temp_dir.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        sys.exit(1)

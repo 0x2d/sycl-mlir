@@ -11,6 +11,8 @@ This document describes how to build the `sycl-mlir` compiler with HIP/AMD backe
 | DTK (ROCm fork) | `/public/software/compiler/dtk/dtk-25.04.1/` (loaded via `module load compiler/rocm/dtk/25.04.1`) |
 | CMake, Ninja | provided by the conda env |
 
+由于OpenCL-Headers最新Commit与sycl-mlir不兼容，因此需要手动选择旧版本，修改 OpenCL-Headers.git/refs/heads/main 内容为 8275634cf9ec31b6484c2e6be756237cb583999d
+
 ## Why the stock build.sh isn't enough
 
 Three issues bite on this cluster:
@@ -170,25 +172,15 @@ At runtime, `libpi_hip.so` (under `build/install/lib/`) loads DTK's `libamdhip64
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=dcu:1
 
-module unload compiler/devtoolset/7.3.1 2>/dev/null
-module unload mpi/hpcx/2.11.0/gcc-7.3.1 2>/dev/null
-module unload compiler/rocm/dtk/22.10.1 2>/dev/null
+module unload compiler/devtoolset/7.3.1
+module unload mpi/hpcx/2.11.0/gcc-7.3.1
+module unload compiler/rocm/dtk/22.10.1
 module load compiler/rocm/dtk/25.04.1
-
 source ~/Tools/setgcc.sh
-unset CPLUS_INCLUDE_PATH C_INCLUDE_PATH
 
-export DTK_HOME=/public/software/compiler/dtk/dtk-25.04.1
-export LD_LIBRARY_PATH=/public/home/liuying/sycl-mlir/build/install/lib:$DTK_HOME/lib:$DTK_HOME/lib64:$DTK_HOME/hip/lib:$DTK_HOME/llvm/lib:/public/home/liuying/Tools/gcc/11.2.0/lib64:$LD_LIBRARY_PATH
-export PATH=$DTK_HOME/bin:$DTK_HOME/hip/bin:$PATH
-export OMP_NUM_THREADS=6
+export LD_LIBRARY_PATH=/public/home/liuying/sycl-mlir/build/install/lib:$LD_LIBRARY_PATH
 
-echo "=== hostname ==="; hostname
-echo "=== sycl-ls ==="
-ONEAPI_DEVICE_SELECTOR=hip:* /public/home/liuying/sycl-mlir/build/install/bin/sycl-ls 2>&1 || true
-echo "=== Run a.out ==="
-ONEAPI_DEVICE_SELECTOR=hip:* SYCL_PI_TRACE=2 ./a.out
-echo "EXIT=$?"
+ONEAPI_DEVICE_SELECTOR=hip:* ./a.out
 ```
 
 ## Build vs install gotcha
