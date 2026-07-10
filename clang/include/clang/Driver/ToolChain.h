@@ -163,6 +163,7 @@ private:
   mutable std::unique_ptr<Tool> SPIRVTranslator;
   mutable std::unique_ptr<Tool> SYCLPostLink;
   mutable std::unique_ptr<Tool> BackendCompiler;
+  mutable std::unique_ptr<Tool> Opt;
   mutable std::unique_ptr<Tool> AppendFooter;
   mutable std::unique_ptr<Tool> FileTableTform;
   mutable std::unique_ptr<Tool> SpirvToIrWrapper;
@@ -184,6 +185,7 @@ private:
   Tool *getSPIRVTranslator() const;
   Tool *getSYCLPostLink() const;
   Tool *getBackendCompiler() const;
+  Tool *getOpt() const;
   Tool *getAppendFooter() const;
   Tool *getTableTform() const;
   Tool *getSpirvToIrWrapper() const;

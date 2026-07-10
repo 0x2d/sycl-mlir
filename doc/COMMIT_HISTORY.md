@@ -350,3 +350,104 @@ AMDGPU has no f64 ISel pattern for the transcendental LLVM intrinsics (`llvm.int
 End-to-end effect: a SYCL kernel using f64 transcendentals (e.g. `sycl::sin`, `std::exp`, `std::pow` over `double`) now compiles cleanly under `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir`. After `convert-polygeist-to-llvm sycl-target=rocdl`, `math.*Op`s become `llvm.call @__ocml_*_f64` rather than `llvm.intr.*`, and the AMDGPU backend resolves the calls against the ocml.bc bitcode that the HIP driver links at finalize. SPIR64 is byte-identical to before. One sharp edge: the relative include `../../../../mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h` reaches into MLIR's private headers and will silently break if upstream restructures `GPUCommon/`; long-term the right move is either to upstream the header to `include/mlir/Conversion/GPUCommon/` or copy the small template into mlir-sycl.
 
 ---
+
+## 986f9be7c9e8 — [SYCL-MLIR] Set cgeist LLVMMod DataLayout from target before CGM init
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-05-28
+- **Files:**
+  - `polygeist/tools/cgeist/Lib/clang-mlir.h` (+8)
+  - `polygeist/tools/cgeist/Test/Verification/sycl/accessor-local-amdgcn.cpp` (new, +42)
+  - `COMMIT_HISTORY.md` (+23)
+
+cgeist constructed its `llvm::Module LLVMMod` without a target `DataLayout`, so `CodeGenModule`'s record-layout queries (`getTypeAllocSize`, struct layout) fell back to LLVM defaults — which assume a 64-bit pointer in every address space. On AMDGCN that's wrong for `__local` storage: a pointer in address space 3 is 32-bit, so the LLVM default of 8 bytes disagreed with the AST's 4-byte layout for the `MData` member inside `sycl::accessor`, producing an apparent overlap with the following field that tripped `CGRecordLowering::clipTailPadding`'s `NoUniqueAddressAttr` assertion when cgeist lowered a `sycl::accessor<int, 1, ..., target::local>`.
+
+- **`clang-mlir.h`** — Adds `#include "clang/Basic/TargetInfo.h"` and a `bool DataLayoutInitialized` member that sits between `LLVMMod` and `CGM` in the `MLIRScanner` member declaration order (so also in the initializer-list order). It is initialized with a comma expression `(LLVMMod.setDataLayout(AstContext.getTargetInfo().getDataLayoutString()), true)` — i.e. it calls `LLVMMod.setDataLayout(...)` *before* the `CGM` member is constructed. Member-init order matters here: `CGM` (the next member) caches data-layout info during construction, so the `DataLayout` must be set first. The `bool` result is just a vehicle to inject a side effect into the initializer list; it's never read.
+
+- **`accessor-local-amdgcn.cpp`** — New regression lit test. A minimal SYCL kernel using a `target::local` accessor (`sycl::accessor<int, 1, access::mode::read_write, target::local>`) inside an `nd_range` `parallel_for`, driven through `clang++ -fsycl -fsycl-device-only -fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xsycl-target-backend --offload-arch=gfx906`. Run at both `-O0` and `-O2`. Uses `--implicit-check-not="{{Assertion|reused this field's tail padding}}"` to assert the `NoUniqueAddressAttr` assertion no longer fires, plus positive `CHECK` lines pinning that the emitted datalayout contains `p3:32:32` (the AMDGCN 32-bit local-pointer rule) and that the kernel signature takes the local accessor as `ptr addrspace(3)`. Comment block documents the root cause.
+
+- **`COMMIT_HISTORY.md`** — Backfills the entry for `75978e7` (the ocml-transcendentals commit) that hadn't been logged when it was committed.
+
+End-to-end effect: the local-accessor path that crashed cgeist on AMDGCN now lowers cleanly, and the AMDGCN data layout (`p3:32:32`, etc.) is visible in the emitted module. No SPIR64 impact — the SPIR64 data layout is also applied the same way (the fix is target-agnostic: it just reads whatever target `ASTContext` was configured with). One sharp edge: the comma-expression-in-initializer-list trick is unusual and easy to misread as dead code; a future cleanup could move `setDataLayout` into a small `LLVMMod`-initializing helper, but member-init ordering makes a plain statement-form fix awkward since `LLVMMod` is constructed by its own initializer.
+
+---
+
+## c54f8b85500c — [SYCL-MLIR] Enable struct-flattening ABI for AMDGCN cgeist codegen
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-06-30
+- **Files:**
+  - `polygeist/tools/cgeist/Lib/CodeGenTypes.h` (+13 / -3)
+  - `polygeist/tools/cgeist/Lib/CodeGenTypes.cc` (+28 / -25)
+  - `polygeist/tools/cgeist/Lib/CGCall.cc` (+65 / -5)
+  - `polygeist/tools/cgeist/Lib/clang-mlir.cc` (+105 / -13)
+  - `polygeist/tools/cgeist/Lib/clang-mlir.h` (+17 / -7)
+  - `polygeist/tools/cgeist/Test/Verification/packedstruct.c` (+12 / -4)
+  - `polygeist/tools/cgeist/Test/Verification/sycl/struct-flatten-amdgcn.cpp` (new, +78)
+  - `polygeist/tools/cgeist/Test/Verification/sycl/h_item-flatten-amdgcn.cpp` (new, +45)
+
+Until this commit, `AllowStructFlattening` in `CodeGenTypes.cc` was hard-coded `false` with a "Need to revisit" TODO, and any aggregate whose Itanium ABI lowering classified it as `Direct` + `canBeFlattened` hit a `CGEIST_WARNING` ("struct should be flattened but MLIR codegen cannot yet handle it") and was passed as a single pointer. On SPIR64 that's tolerable because the SPIR calling convention passes small aggregates by-pointer. On AMDGCN, the AMDGPU calling convention *flattens* small aggregates into multiple scalar IR args — so the cgeist `func.func` (single aggregate arg) disagreed with its call sites (multiple scalar args) and phase-3 finalize aborted with `'llvm.call' op incorrect number of operands`. This commit turns flattening on with a guard and wires it through caller and callee symmetrically.
+
+- **`CodeGenTypes.cc` / `CodeGenTypes.h`** — Flips `AllowStructFlattening` to `true`. The two `CGEIST_WARNING` blocks ("struct should be flattened but MLIR codegen cannot yet handle it") are deleted — flattening is now honored, so the warning is stale. The central guard, mirrored in both `ClangToLLVMArgMapping::construct` and `getFunctionType`, is: only flatten when the *MLIR-side* aggregate is an `LLVM::LLVMStructType` whose `getBody().size()` equals the LLVM `CoerceToType` element count. This is needed because `ClangToLLVMArgMapping` reasons about the LLVM CoerceToType while the MLIR arg type is built from the declared C++ type, and the two can disagree in two directions:
+  - **SYCL dialect types** (e.g. `!sycl.nd_item<N>`, `!sycl.item<N>`) — LLVM coerces the underlying struct to N fields, but the MLIR type is a single opaque dialect type, not an `LLVMStructType`. Stay as one MLIR arg.
+  - **SysV i64-coerced small structs** — the SysV ABI coerces a small struct (e.g. two i32s) to a single `i64`, so `NumIRArgs == 1`, but the MLIR type is still a 2-field `LLVMStructType`. The `NumIRArgs > 1` half of the guard rejects this case so it isn't wrongly flattened.
+  To make `ClangToLLVMArgMapping` able to consult the MLIR type, the constructor and `construct` gain a `CodeGenTypes &Types` parameter (no longer defaulted); the header gains a forward declaration of `CodeGenTypes` and a doc comment explaining the consultation is load-bearing. All three call sites (`getFunctionType`, `constructAttributeList`, and the two in `CGCall.cc`/`clang-mlir.cc`) pass `*this` / `Glob.getTypes()`.
+
+- **`CGCall.cc::callHelper`** (caller side) — Builds a single `ClangToLLVMArgMapping` up front (reused for the sret lookup) instead of constructing a throwaway one inside the `if (IsSRet)` block. Adds an `ABIArgInfo::Ignore` short-circuit (no IR arg corresponds to an ignored clang arg, so skip it). Changes the "too many arguments" guard from an `assert(false)` to a `return ValueCategory()` with a `mlir::emitError`, and corrects the bound check from `I >= FnType.getInputs().size()` to `Args.size() >= ...` (I is the clang-formal index, Args is the MLIR-arg index — with flattening they diverge). The new flatten block: when `Val` is an `LLVMStructType` and `ArgMapping.getIRArgs(I)` reports `NumIRArgs > 1` matching `STy.getBody().size()`, materialize `Val` into an `LLVM::AllocaOp` scratch slot (in `getAllocaAddrSpace()`) at `AllocationScope`, store the whole aggregate via `ValueCategory::store`, then `GEP` each field and `LoadOp` it, pushing N scalar args. A comment notes the deliberate AS asymmetry: the caller scratch slot lives in AllocaAS (AMDGPU private AS 5) and its GEP/Load are in AllocaAS, while the callee prologue casts its slot back to flat AS 0 — the caller slot is local to the call sequence, the callee slot is the parameter's stack slot accessed in flat AS by the body; "don't normalize one to match the other."
+
+- **`clang-mlir.cc::MLIRScanner::init`** (callee side) — Symmetric counterpart. Builds the `ClangToLLVMArgMapping` once (hoisted out of the `if (IsSRet)` block so it's in scope). For each clang formal whose MLIR type is an `LLVMStructType` that the ABI flattened into `NumIRArgs > 1` matching fields, allocates the struct via `createAllocOp(..., /*LLVMABI=*/true)` and `GEP`+`StoreOp`s each of the N incoming IR args into its field slot, then advances `IRIdx = FirstIRArg + NumIRArgs`, calls `MaybeSkipSRet()`, and `continue`s the formal loop. Critically uses **field-wise GEP+store**, *not* `llvm.insertvalue` — because the struct's fields can be SYCL dialect types (e.g. `h_item<1>` lowers to `!llvm.struct<(!sycl.item, !sycl.item, !sycl.item)>`), and `llvm.insertvalue` requires primitive LLVM operands.
+
+- **`clang-mlir.cc::createAllocOp`** — Routs all alloca paths through `getAllocaAddrSpace()`. Computes `StorageAS = (MemSpace == 0) ? AllocaAS : MemSpace` so a flat-AS (`MemSpace == 0`) request lands in the target's alloca AS (AMDGPU private AS 5) on the actual `LLVM::AllocaOp`/`memref::AllocaOp`, then bridges back to the requested `MemSpace` via `LLVM::AddrSpaceCastOp` when they differ. Applied symmetrically across all three branches: the `LLVMABI` scalar/VLA branch (raw alloca in StorageAS, optional addrspacecast to MemSpace), the memref branch (build the memref in StorageAS, then `Memref2PointerOp` → `AddrSpaceCastOp` → `Pointer2MemrefOp` to get a flat-AS memref), and the array-shaped memref branch (same Memref2Pointer/AddrSpaceCast/Pointer2Memref bridge). The previous code hardcoded flat AS for the alloca and only cast when `MemSpace != 0`; on AMDGCN that produced an `i64 = FrameIndex` SDNode matched against an addrspace(0) pointer, aborting in ISel.
+
+- **`clang-mlir.h`** — `Bufs` changes from `map<const void*, vector<LLVM::AllocaOp>>` to `map<const void*, vector<Value>>` and `allocateBuffer` returns `Value`, because the cached entry may now be an `AddrSpaceCastOp` result rather than the bare `AllocaOp`. `allocateBuffer` computes `StorageTy` in `AllocaAS`, allocates there, and addrspacecasts back to the requested pointer type `T` when they differ.
+
+- **`packedstruct.c`** — Existing lit test, updated to the new flatten shape. The `compute` caller now allocas the aggregate, stores the by-pointer arg into it, GEPs each field, loads, and passes the flattened scalars to `@run`. The `@run` call signature changes from `(!llvm.struct<(i64, i8)>, i8)` to `(i64, i8, i8)`.
+
+- **`struct-flatten-amdgcn.cpp`** (new) — Smoke test for both fixes at once: a `SobelMin` kernel whose functor captures a 16-byte `Point` aggregate by value (exercises the flatten path) and whose parameter staging allocas must land in AS 5 (exercises the alloca-AS fix). `CHECK-DAG`s `alloca {{.*}}, addrspace(5)` and `addrspacecast ptr addrspace(5) ... to ptr`; `--implicit-check-not="{{Assertion|struct should be flattened}}"`. Explicitly not a bit-exact IR test (accessor/capture layout varies with header revisions).
+
+- **`h_item-flatten-amdgcn.cpp`** (new) — Smoke test for the callee-side flatten prologue on a non-dialect aggregate: `h_item<1>` is *not* a SYCL dialect type (hierarchical parallelism is deferred in this build), so cgeist emits `!llvm.struct<(!sycl.item, !sycl.item, !sycl.item)>`, which AMDGPU flattens, exercising the per-field GEP+store reassembly in `MLIRScanner::init`. `CHECK`s `getelementptr` / `store` appear in the kernel body; `--implicit-check-not="{{Assertion|Callsite argument mismatch}}"`.
+
+End-to-end effect: AMDGCN kernels that pass small aggregates by value (the common case — captured accessors, `id`, `h_item`, functor captures) now compile through phase-3 finalize without the `incorrect number of operands` verifier failure, and AMDGPU private-AS stack slots are emitted in AS 5 with addrspacecasts back to flat. Two sharp edges worth flagging: (1) the `ClangToLLVMArgMapping` consultation of `Types.getMLIRType(...)` means the mapping now depends on full MLIR type construction being available at mapping time — a future target that builds MLIR types lazily would break it; (2) the deliberate caller-vs-callee address-space asymmetry in the flatten scratch slots is load-bearing and easy to "fix" into a bug.
+
+---
+
+## 0ec753bb8cf9 — [SYCL-MLIR] Add Sunway driver, bench scripts, and reorganize build docs
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-07-01
+- **Files:**
+  - `script/swsyclmlir` (new, +496)
+  - `script/run-syclbench-sw.sh` (new, +29)
+  - `script/syclbench-summary.py` (new, +90)
+  - `doc/BUILD_130.md` (new, +31)
+  - `doc/BUILD_SW.md` (new, +27)
+  - `doc/BUILD_HIP.md` (new, +206; supersedes `BUILD_AMD.md`)
+  - `doc/COMMIT_HISTORY.md` (moved from `COMMIT_HISTORY.md`, +352 / −352 at old path)
+  - `BUILD_AMD.md` (deleted, −214)
+  - `COMMIT_HISTORY.md` (deleted at old path)
+
+A grab-bag commit: ports the SYCL-MLIR device-compile flow to the Sunway (sw) platform via a new Python wrapper driver, adds a benchmark submission/diffing workflow, and reorganizes the build docs under `doc/`.
+
+- **`script/swsyclmlir`** (new, ~496 lines, Python) — A standalone driver that masquerades as `clang++`: when the user invokes `swsyclmlir --target=athread -fsycl x.cpp -o a.out`, it runs the host `clang++ -fsycl -###` to capture the full device/host compile pipeline, then intercepts each step and reroutes SYCL device code through cgeist instead of the stock device compiler. Pipeline (numbered per the source comments):
+  - **1.** For each `clang-18 -cc1 -fsycl-is-device` job (device compilation), rewrites `-triple spir64-unknown-unknown` → `spir64-unknown-unknown-syclmlir`, redirects `-triple`/include roots from the swcl `intel-llvm` tree to the local cgeist install, and invokes `cgeist -emit-llvm <source> -o <output> --args <cc1 args>` to produce device LLVM bitcode.
+  - **3.** `llvm-foreach` → SPIR-V step: collects the IL inputs, runs `swcl --target=<athread|openmp> --static-lib` to assemble `libSWCLKernel.a`, and writes an `empty.spv` placeholder (a minimal SPIR-V magic + `OpenCL.std` capability blob, inlined as a byte literal) for each input so the downstream offload-wrapper step has something to bundle.
+  - **4.1/4.2** — `clang-offload-wrapper -kind=sycl` produces wrapper bitcode; `make_wrapper_v13_compatible` post-processes it (run `opt -mtriple=spir64`, null out empty offload-entry symbols, `llvm-as`, `llvm-spirv`, then a *second* `llvm-spirv -r` round-trip through the local toolchain's llvm-spirv to get a v13-compatible `.bc`, appending a `__swcl_sycl_descriptor_reg` registration function) so the wrapper links against the sw runtime. The `llc -filetype=obj` wrapper-compile step is rerouted to `clang -c` (athread) or `llc -mtriple=<host-triple> -relocation-model=pic` (openmp) when not using pure dpcpp.
+  - **6.** `ld` link step (non-dpcpp): instead of the swcl `ld`, compiles a small C constructor (`__swcl_sycl_descriptor_reg_constructor`) that calls the descriptor registration, then links via `swg++`/`clang++` with `-lsycl -lstdc++`, the file-mapped object inputs, and the `libSWCLKernel.link_args.txt` argument list.
+  - `-E -MD` depfile jobs and all other jobs are run through with only a `--fsycl-disable-range-rounding` → `-D__SYCL_DISABLE_PARALLEL_FOR_RANGE_ROUNDING__=1` rewrite.
+  File mapping is handled by `map_file_in_args` / `run_with_file_mapped`, which redirect every `-o`/`--output=`/`-input=` style path into a temp dir (`--save-temps-dir`, default `.swsycl`) and track the original→temp mapping so later steps pick up the rewritten files. `--target` choices are `athread` (Sunway athread slave-core runtime; uses `swg++`/`llc`/`clang` from PATH, `-mdynamic` link) and `openmp` (uses the toolchain's `clang++`, `-fopenmp=libgomp`). Has a `DEBUG_MODE` (set when run as a script, unset when frozen via PyInstaller) that toggles argparse help/options; in frozen mode only `-h` (delegated to clang++ --help) is exposed.
+
+- **`script/run-syclbench-sw.sh`** (new) — Submits every binary in `${SCRIPT_DIR}/benchmarks/*` to the Sunway batch system via `bsub -q q_share -b -m 1 -n 1 -cgsp 64 -share_size 13000 -priv_size 16 -host_stack 1024 -cache_size 128`, each with `--output=sycl-bench.csv` and a per-benchmark size override (`scalar_prod` / `vec_add` → `--size=1024`, else `--size=1024` default). Sets `LD_LIBRARY_PATH` to the sw runtime lib dir.
+
+- **`script/syclbench-summary.py`** (new) — Diffs the LLVM-vs-MLIR sycl-bench CSVs. Loads `sycl-bench/build/sycl-bench.csv` (LLVM/DPC++ baseline) and `sycl-bench/build-mlir/sycl-bench-mlir.csv` (MLIR path) keyed by `(Benchmark name, local-size, problem-size)`, preserves LLVM row order then appends MLIR-only rows, and writes a `sycl-bench-summary.csv` with shared columns (`device-name`) plus per-implementation `Verification` and `run-time-median` columns (`*_llvm` / `*_mlir`). Prints a common/llvm-only/mlir-only key counts summary.
+
+- **`doc/BUILD_130.md`** (new) — Build/run recipe for the 130 cluster: `.gitconfig` `insteadOf` rewrite to reach GitHub through the cluster mirror, the OpenCL-Headers pinning workaround (manually set `OpenCL-Headers.git/refs/heads/main` to `8275634cf9ec31b6484c2e6be756237cb583999d` because the latest commit is incompatible with sycl-mlir), `configure.py`/`compile.py -j16`, and the `PATH`/`LD_LIBRARY_PATH` (with oneAPI TBB) exports for running `clang++ -fsycl -fsycl-targets=spir64-unknown-unknown-syclmlir`.
+
+- **`doc/BUILD_SW.md`** (new) — Build/run recipe for the Sunway/sw environment: `.gitconfig` `insteadOf = "repo:"`, `source /usr/sw/swllvm/setenv-18.sh`, configure with GCC 11.2.0 as the build compiler and `--cmake-gen "Unix Makefiles"` + `-DSYCL_LIBDEVICE_GCC_TOOLCHAIN`, then compile/run via `swsyclmlir --target=athread -fsycl x.cpp` and `bsub ... a.out` with the sw share-memory/stack flags.
+
+- **`doc/BUILD_HIP.md`** (moved from `BUILD_AMD.md`) — The AMDGCN/HIP build doc relocates under `doc/` and gains two edits: (1) the same OpenCL-Headers pinning note as `BUILD_130.md` (set `refs/heads/main` to `8275634...`); (2) the runtime-launch Slurm snippet is slimmed — the verbose `module unload`/`DTK_HOME`/`sycl-ls`/`SYCL_PI_TRACE` block is replaced with a minimal `export LD_LIBRARY_PATH=...build/install/lib` + `ONEAPI_DEVICE_SELECTOR=hip:* ./a.out`. The build recipe itself (DTK 25.04.1 against gfx906, the `amd_comgr` shim, `build/build.sh`) is otherwise unchanged.
+
+- **`doc/COMMIT_HISTORY.md`** — This very document, moved from the repo root to `doc/` so the build docs and history live together. Pure relocation, no content change at move time (subsequent commits, including this entry, append here).
+
+End-to-end effect: `swsyclmlir --target=athread -fsycl x.cpp -o a.out` on a Sunway node now routes the SYCL device compile through the locally-built cgeist (producing spir64-unknown-unknown-syclmlir device IR, bundling it via the swcl toolchain, and linking against the Sunway athread runtime), and `run-syclbench-sw.sh` + `syclbench-summary.py` give a turn-key A/B comparison against the LLVM/DPC++ baseline. Sharp edges: (1) `swsyclmlir` has `/home/oyyc/sycl-mlir/build/install/bin/cgeist` and the sw runtime lib path hard-coded — they're per-developer and won't resolve elsewhere without edits; (2) the `make_wrapper_v13_compatible` SPIR-V round-trip is fragile version glue between the local `llvm-spirv` and the swcl-bundled one, and will need revisiting if either side moves; (3) the `empty.spv` placeholder is a hand-encoded byte literal rather than a generated minimal SPIR-V, so a future SPIR-V validator that checks capability consistency could reject it.
+
+---

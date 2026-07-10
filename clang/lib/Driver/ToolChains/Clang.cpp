@@ -9847,9 +9847,19 @@ void OffloadWrapper::ConstructJob(Compilation &C, const JobAction &JA,
         LlcArgs.push_back(
             TCArgs.MakeArgString(Twine("--code-model=") + A->getValue()));
 
-      SmallString<128> LlcPath(C.getDriver().Dir);
-      llvm::sys::path::append(LlcPath, "llc");
-      const char *Llc = C.getArgs().MakeArgString(LlcPath);
+      // Resolve the llc binary. SYCL_AMDGCN_LLC (if set) overrides the default,
+      // which is the llc next to the clang driver binary. This lets a cmake
+      // build pick up an external llc (e.g. the DTK llc) for the host
+      // offload-wrapper .bc -> host object compile.
+      std::string LlcExe;
+      if (auto Env = llvm::sys::Process::GetEnv("SYCL_AMDGCN_LLC")) {
+        LlcExe = std::move(*Env);
+      } else {
+        SmallString<128> LlcPath(C.getDriver().Dir);
+        llvm::sys::path::append(LlcPath, "llc");
+        LlcExe = LlcPath.str().str();
+      }
+      const char *Llc = C.getArgs().MakeArgString(LlcExe);
       C.addCommand(std::make_unique<Command>(
           JA, *this, ResponseFileSupport::None(), Llc, LlcArgs, std::nullopt));
     }
@@ -10395,6 +10405,60 @@ void SYCLPostLink::ConstructJob(Compilation &C, const JobAction &JA,
       JA, *this, ResponseFileSupport::None(),
       TCArgs.MakeArgString(getToolChain().GetProgramPath(getShortName())),
       CmdArgs, Inputs, Output));
+}
+
+// Runs an external LLVM `opt` over a device bitcode input, producing optimized
+// bitcode for the downstream backend. The opt binary path comes from the
+// SYCL_AMDGCN_OPT environment variable (whose presence also enables this step
+// in the driver); SYCL_AMDGCN_OPT_FLAGS overrides the pass arguments (default
+// "-O2"). Falls back to GetProgramPath("opt") if the env var is somehow empty.
+void Opt::ConstructJob(Compilation &C, const JobAction &JA,
+                      const InputInfo &Output, const InputInfoList &Inputs,
+                      const llvm::opt::ArgList &TCArgs,
+                      const char *LinkingOutput) const {
+  assert(isa<OptJobAction>(JA) && "Expecting opt job!");
+  assert(Inputs.size() == 1 && Inputs.front().isFilename() &&
+         "single bitcode input expected");
+  assert(Output.isFilename() && "output must be a filename");
+
+  ArgStringList CmdArgs;
+
+  // Pass arguments: default to -O2, override via SYCL_AMDGCN_OPT_FLAGS.
+  if (auto Flags = llvm::sys::Process::GetEnv("SYCL_AMDGCN_OPT_FLAGS")) {
+    // Split on whitespace (spaces/tabs).
+    StringRef Rest = *Flags;
+    while (!Rest.empty()) {
+      Rest = Rest.ltrim(" \t");
+      if (Rest.empty())
+        break;
+      size_t End = Rest.find_first_of(" \t");
+      if (End == StringRef::npos) {
+        CmdArgs.push_back(C.getArgs().MakeArgString(Rest));
+        break;
+      }
+      CmdArgs.push_back(C.getArgs().MakeArgString(Rest.substr(0, End)));
+      Rest = Rest.drop_front(End);
+    }
+  } else {
+    CmdArgs.push_back("-O2");
+  }
+
+  // Input then output: `opt <flags> <in.bc> -o <out.bc>`.
+  CmdArgs.push_back(Inputs.front().getFilename());
+  CmdArgs.push_back("-o");
+  CmdArgs.push_back(Output.getFilename());
+
+  // Resolve the opt binary. SYCL_AMDGCN_OPT (set by the driver when it inserts
+  // this action) gives the exact path; otherwise fall back to GetProgramPath.
+  std::string OptExe;
+  if (auto Env = llvm::sys::Process::GetEnv("SYCL_AMDGCN_OPT"))
+    OptExe = std::move(*Env);
+  else
+    OptExe = getToolChain().GetProgramPath(getShortName());
+  const char *Opt = C.getArgs().MakeArgString(OptExe);
+
+  C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
+                                          Opt, CmdArgs, Inputs));
 }
 
 // Transforms the abstract representation (JA + Inputs + Outputs) of a file

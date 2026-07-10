@@ -546,6 +546,12 @@ Tool *ToolChain::getBackendCompiler() const {
   return BackendCompiler.get();
 }
 
+Tool *ToolChain::getOpt() const {
+  if (!Opt)
+    Opt.reset(new tools::Opt(*this));
+  return Opt.get();
+}
+
 Tool *ToolChain::getAppendFooter() const {
   if (!AppendFooter)
     AppendFooter.reset(new tools::AppendFooter(*this));
@@ -624,6 +630,9 @@ Tool *ToolChain::getTool(Action::ActionClass AC) const {
 
   case Action::BackendCompileJobClass:
     return getBackendCompiler();
+
+  case Action::OptJobClass:
+    return getOpt();
 
   case Action::AppendFooterJobClass:
     return getAppendFooter();

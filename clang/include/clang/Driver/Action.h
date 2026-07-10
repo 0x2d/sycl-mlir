@@ -81,6 +81,7 @@ public:
     SPIRVTranslatorJobClass,
     SYCLPostLinkJobClass,
     BackendCompileJobClass,
+    OptJobClass,
     FileTableTformJobClass,
     AppendFooterJobClass,
     SpirvToIrWrapperJobClass,
@@ -824,6 +825,20 @@ public:
 
   static bool classof(const Action *A) {
     return A->getKind() == BackendCompileJobClass;
+  }
+};
+
+// Represents an opt pass run over device bitcode (e.g. SYCL AMDGCN device
+// kernels after sycl-post-link splitting). Enabled via the SYCL_AMDGCN_OPT
+// environment variable; produces LLVM bitcode for the downstream backend.
+class OptJobAction : public JobAction {
+  void anchor() override;
+
+public:
+  OptJobAction(Action *Input, types::ID OutputType);
+
+  static bool classof(const Action *A) {
+    return A->getKind() == OptJobClass;
   }
 };
 

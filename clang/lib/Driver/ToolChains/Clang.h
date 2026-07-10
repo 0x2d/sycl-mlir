@@ -240,6 +240,23 @@ public:
                     const char *LinkingOutput) const override;
 };
 
+/// opt pass runner. Runs an external LLVM `opt` over a device bitcode input.
+/// Used by the SYCL AMDGCN pipeline (inserted after sycl-post-link splitting)
+/// when the SYCL_AMDGCN_OPT environment variable is set; the variable's value
+/// is the opt binary path, and SYCL_AMDGCN_OPT_FLAGS overrides the pass args
+/// (default "-O2").
+class LLVM_LIBRARY_VISIBILITY Opt final : public Tool {
+public:
+  Opt(const ToolChain &TC) : Tool("opt", "opt", TC) {}
+
+  bool hasIntegratedCPP() const override { return false; }
+  bool hasGoodDiagnostics() const override { return true; }
+  void ConstructJob(Compilation &C, const JobAction &JA,
+                    const InputInfo &Output, const InputInfoList &Inputs,
+                    const llvm::opt::ArgList &TCArgs,
+                    const char *LinkingOutput) const override;
+};
+
 /// File table transformation tool.
 class LLVM_LIBRARY_VISIBILITY FileTableTform final : public Tool {
 public:

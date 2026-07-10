@@ -54,6 +54,8 @@ const char *Action::getClassName(ActionClass AC) {
     return "sycl-post-link";
   case BackendCompileJobClass:
     return "backend-compiler";
+  case OptJobClass:
+    return "opt";
   case FileTableTformJobClass:
     return "file-table-tform";
   case AppendFooterJobClass:
@@ -523,6 +525,11 @@ BackendCompileJobAction::BackendCompileJobAction(ActionList &Inputs,
 BackendCompileJobAction::BackendCompileJobAction(Action *Input,
                                                  types::ID Type)
     : JobAction(BackendCompileJobClass, Input, Type) {}
+
+void OptJobAction::anchor() {}
+
+OptJobAction::OptJobAction(Action *Input, types::ID Type)
+    : JobAction(OptJobClass, Input, Type) {}
 
 void FileTableTformJobAction::anchor() {}
 

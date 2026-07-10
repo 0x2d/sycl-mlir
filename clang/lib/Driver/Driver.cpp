@@ -4869,6 +4869,16 @@ class OffloadingActionBuilder final {
 
     JobAction *finalizeAMDGCNDependences(Action *Input,
                                          const llvm::Triple &TT) {
+      // Optionally run an external `opt` pass over each split device bitcode
+      // file before the backend compile. Enabled by the SYCL_AMDGCN_OPT
+      // environment variable (its value is the opt binary path; pass args come
+      // from SYCL_AMDGCN_OPT_FLAGS, default -O2). Because this action lives
+      // inside the ForEachWrappingAction built around FinAction, opt runs once
+      // per split per-kernel .bc, between the file-table-tform -extract=Code
+      // step and the clang -cc1 -x ir backend step.
+      if (llvm::sys::Process::GetEnv("SYCL_AMDGCN_OPT"))
+        Input = C.MakeAction<OptJobAction>(Input, types::TY_LLVM_BC);
+
       auto *BA = C.getDriver().ConstructPhaseAction(
           C, Args, phases::Backend, Input, AssociatedOffloadKind);
 
