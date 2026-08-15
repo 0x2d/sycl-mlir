@@ -61,6 +61,10 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
@@ -772,6 +776,140 @@ getSYCLTargetFromTriple(const llvm::Triple &Triple) {
   }
 }
 
+namespace {
+/// Whether an LLVM-IR argument type is an accessor base pointer for the
+/// purposes of SYCL kernel-arg metadata. This mirrors the clang CodeGen rule
+/// (CodeGenModule::GenKernelArgMetadata, which keys on `SYCLAccessorPtrAttr`)
+/// empirically: across every SPIR device kernel inspected, the accessor base
+/// pointers are exactly the pointer arguments in address space 1 (global) or
+/// 3 (local), while `i64` and `ptr addrspace(4) byref(range/id)` args are not.
+/// The rule is purely LLVM-IR-type-driven, so it can be reproduced from the
+/// `llvm::Function` argument types alone — no clang AST required.
+static bool isAccessorBasePtr(llvm::Type *Ty) {
+  auto *PtrTy = llvm::dyn_cast<llvm::PointerType>(Ty);
+  if (!PtrTy)
+    return false;
+  unsigned AS = PtrTy->getAddressSpace();
+  return AS == 1 || AS == 3;
+}
+} // namespace
+
+/// Attach the SYCL kernel-arg metadata that clang CodeGen emits on the SPIR
+/// path (CodeGenModule::GenKernelArgMetadata + the SYCL module-metadata
+/// emitters) but the cgeist C->MLIR->LLVM path skips, since it never runs
+/// clang CodeGen for device code.
+///
+/// The decisive node is `!kernel_arg_exclusive_ptr`: per
+/// sycl/ReleaseNotes.md and CodeGenModule.cpp:2401-2410 it marks pointers that
+/// are illegal to dereference from outside the current kernel invocation — the
+/// anti-aliasing guarantee the AMDGPU backend uses to give distinct local
+/// pointers distinct LDS regions. Without it, kernels with >=2 local
+/// accessors collapse/alias and mis-compile; with 1 local there is no partner
+/// to alias with, so they still pass. See local-accessor-amdgcn-flatcast-bug.md.
+///
+/// `kernel_arg_runtime_aligned` and `kernel_arg_exclusive_ptr` share one i1
+/// vector, `true` for each accessor base pointer arg and `false` otherwise
+/// (clang emits the same node for both at :2429/:2430). `kernel_arg_buffer_location`
+/// is a vector of `-1`, length = arg count, emitted regardless. Module-level
+/// `opencl.spir.version`/`opencl.ocl.version`/`spirv.Source`/`amdgpu_code_object_version`
+/// mirror the SYCL/OpenCL emitters (:1229/:1389/:890).
+///
+/// `amdgcn.annotations` (the decisive node for the >=2-local-accessor bug):
+/// one `!{ptr @kernel, !"kernel", i32 1}` per `amdgpu_kernel`, mirroring
+/// clang's `AMDGPUTargetCodeGenInfo::addAMDGCNMetadata` (AMDGPU.cpp:388-391,
+/// test CodeGenSYCL/kernel-annotation.cpp). Without it, `llc` classifies
+/// local-accessor (`ptr addrspace(3)`) kernel args as `dynamic_shared_pointer`
+/// and the SYCL HIP runtime spaces multiple local args by the code-object
+/// pointer-slot `.size` (=4) instead of the host buffer size, so the 2nd local
+/// accessor overlaps the 1st (B at A+4 instead of A+1024) -> 2-local kernels
+/// mis-compile. With the annotation, `llc` classifies them as `by_value` and
+/// the runtime spaces by the host buffer size -> distinct LDS regions. See
+/// local-accessor-amdgcn-lever-amdgcn-annotations.md.
+static void emitSYCLKernelArgMetadata(llvm::Module &M) {
+  llvm::LLVMContext &Ctx = M.getContext();
+  llvm::IntegerType *Int32Ty = llvm::IntegerType::get(Ctx, 32);
+  llvm::Constant *TrueVal = llvm::ConstantInt::getTrue(Ctx);
+  llvm::Constant *FalseVal = llvm::ConstantInt::getFalse(Ctx);
+  llvm::Constant *NegOne =
+      llvm::ConstantInt::get(Int32Ty, llvm::APInt(32, static_cast<uint64_t>(-1),
+                                                  /*isSigned=*/true));
+
+  // Per-kernel metadata. The cgeist ROCDL path emits `amdgpu_kernel` kernels;
+  // that calling convention naturally excludes host helpers like the
+  // RoundedRangeKernel...::cl wrappers.
+  llvm::SmallVector<llvm::Function *, 8> Kernels;
+  for (llvm::Function &F : M) {
+    if (F.getCallingConv() != llvm::CallingConv::AMDGPU_KERNEL)
+      continue;
+    Kernels.push_back(&F);
+
+    llvm::SmallVector<llvm::Metadata *, 8> ExclusivePtrs;
+    llvm::SmallVector<llvm::Metadata *, 8> BufferLoc;
+    bool AnyAccessor = false;
+
+    for (llvm::Argument &Arg : F.args()) {
+      bool IsAccessor = isAccessorBasePtr(Arg.getType());
+      AnyAccessor |= IsAccessor;
+      ExclusivePtrs.push_back(
+          llvm::ConstantAsMetadata::get(IsAccessor ? TrueVal : FalseVal));
+      BufferLoc.push_back(llvm::ConstantAsMetadata::get(NegOne));
+    }
+
+    // Emitted regardless of accessor presence (matches clang :2423).
+    F.setMetadata("kernel_arg_buffer_location",
+                  llvm::MDNode::get(Ctx, BufferLoc));
+    if (AnyAccessor) {
+      // Same node for both, exactly as clang does at :2429/:2430.
+      F.setMetadata("kernel_arg_runtime_aligned",
+                    llvm::MDNode::get(Ctx, ExclusivePtrs));
+      F.setMetadata("kernel_arg_exclusive_ptr",
+                    llvm::MDNode::get(Ctx, ExclusivePtrs));
+    }
+    // Empty node (`!N = !{}`), as emitted on the SPIR path.
+    F.setMetadata("sycl_fixed_targets", llvm::MDNode::get(Ctx, {}));
+  }
+
+  // Module-level metadata (emit once).
+  // `amdgcn.annotations`: one `!{ptr @kernel, !"kernel", i32 1}` per
+  // amdgpu_kernel, mirroring clang's addAMDGCNMetadata (AMDGPU.cpp:388). This
+  // is what makes `llc` classify local-accessor args as `by_value` (host-filled
+  // offset, correct buffer-size spacing) instead of `dynamic_shared_pointer`
+  // (runtime mis-spaces by the pointer-slot .size -> >=2-local aliasing).
+  llvm::NamedMDNode *AnnotationsMD =
+      M.getOrInsertNamedMetadata("amdgcn.annotations");
+  for (llvm::Function *F : Kernels) {
+    llvm::Metadata *AnnVals[] = {
+        llvm::ConstantAsMetadata::get(F),
+        llvm::MDString::get(Ctx, "kernel"),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 1))};
+    AnnotationsMD->addOperand(llvm::MDNode::get(Ctx, AnnVals));
+  }
+
+  // SYCL advertises SPIR 1.2 / OpenCL 2.0.
+  llvm::Metadata *SPIRVerElts[] = {
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 1)),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 2))};
+  M.getOrInsertNamedMetadata("opencl.spir.version")
+      ->addOperand(llvm::MDNode::get(Ctx, SPIRVerElts));
+
+  llvm::Metadata *OCLVerElts[] = {
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 2)),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 0))};
+  M.getOrInsertNamedMetadata("opencl.ocl.version")
+      ->addOperand(llvm::MDNode::get(Ctx, OCLVerElts));
+
+  // 4 = OpenCL_CPP non-ESIMD, 100000 = OpenCL C++ 1.0 — the value clang uses
+  // when no `sycl_explicit_simd` kernel exists, which is the case here.
+  llvm::Metadata *SPIRVSourceElts[] = {
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 4)),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, 100000))};
+  M.getOrInsertNamedMetadata("spirv.Source")
+      ->addOperand(llvm::MDNode::get(Ctx, SPIRVSourceElts));
+
+  // COV v4 (matches clang :895 with CodeObjectVersion=400).
+  M.addModuleFlag(llvm::Module::Error, "amdgpu_code_object_version", 400);
+}
+
 static LogicalResult finalize(mlir::MLIRContext &Ctx,
                               mlir::OwningOpRef<mlir::ModuleOp> &Module,
                               Options &options, llvm::DataLayout &DL,
@@ -870,6 +1008,7 @@ static LogicalResult finalize(mlir::MLIRContext &Ctx,
       PM3.addPass(arith::createArithExpandOpsPass());
       PM3.addPass(createConvertPolygeistToLLVM(ConvertOptions));
       PM3.addPass(createReconcileUnrealizedCastsPass());
+
       // PM3.addPass(mlir::createLowerFuncToLLVMPass(options));
       if (!options.getCgeistOpts().getSYCLIsDevice() ||
           ConvertOptions.syclTarget == sycl::LoweringTarget::SPIR)
@@ -1008,6 +1147,14 @@ static LogicalResult compileModule(mlir::OwningOpRef<mlir::ModuleOp> &Module,
 
     LLVMModule->setDataLayout(DL);
     LLVMModule->setTargetTriple(Triple.getTriple());
+
+    // ROCDL: attach the SYCL kernel-arg metadata that clang CodeGen emits on
+    // the SPIR path but the cgeist (C->MLIR->LLVM) path skips. Without
+    // !kernel_arg_exclusive_ptr the AMDGPU backend gives >=2 local accessors
+    // overlapping LDS regions. See local-accessor-amdgcn-flatcast-bug.md.
+    if (options.getCgeistOpts().getSYCLIsDevice() &&
+        ExitOnErr(getSYCLTargetFromTriple(Triple)) == sycl::LoweringTarget::ROCDL)
+      emitSYCLKernelArgMetadata(*LLVMModule);
 
     LLVM_DEBUG(llvm::dbgs()
                << "*** Translated MLIR to LLVM IR successfully ***\n");

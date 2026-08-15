@@ -23,12 +23,24 @@ namespace TargetHelpers {
 KernelPayload::KernelPayload(Function *Kernel, MDNode *MD)
     : Kernel(Kernel), MD(MD) {}
 
+// Match the AMDHSA triples by *prefix* rather than exact equality. The
+// SYCL-MLIR device target uses the environment-suffixed triple
+// `amdgcn-amd-amdhsa-syclmlir` (Triple::SYCLMLIR); an exact `==` match would
+// leave it ArchType::Unsupported, causing LocalAccessorToSharedMemoryPass
+// (and GlobalOffsetPass, which shares this gate) to no-op. That leaves
+// local-accessor (`ptr addrspace(3)`) kernel args un-rewritten to `i32`
+// offsets, so the HSA metadata emitter classifies them as
+// `dynamic_shared_pointer` instead of `by_value`, and the runtime mis-spaces
+// >=2 local accessors by the pointer-slot size (not the host buffer size),
+// making their LDS tiles alias. Prefix-matching keeps the plain
+// `amdgcn-amd-amdhsa` / `amdgcn--amdhsa` outcomes identical while also
+// recognizing env-suffixed variants.
 ArchType getArchType(const Module &M) {
   return StringSwitch<ArchType>(M.getTargetTriple().c_str())
       .Case("nvptx64-nvidia-cuda", ArchType::Cuda)
       .Case("nvptx-nvidia-cuda", ArchType::Cuda)
-      .Case("amdgcn-amd-amdhsa", ArchType::AMDHSA)
-      .Case("amdgcn--amdhsa", ArchType::AMDHSA)
+      .StartsWith("amdgcn-amd-amdhsa", ArchType::AMDHSA)
+      .StartsWith("amdgcn--amdhsa", ArchType::AMDHSA)
       .Default(ArchType::Unsupported);
 }
 
