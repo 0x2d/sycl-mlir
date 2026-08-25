@@ -7,6 +7,7 @@ set(LIBS
   MLIRSYCLToROCDL
   MLIRSYCLToSPIRV
   MLIRSYCLTransforms
+  MLIRPolygeistDialect
 )
 
 if(MLIR_INCLUDE_TESTS)

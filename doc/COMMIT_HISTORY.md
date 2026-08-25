@@ -533,3 +533,78 @@ End-to-end effect: a `CovarianceCovar` kernel compiled with `-fsycl-targets=amdg
 
 ---
 
+## [SYCL-MLIR] Add SYRK register-accumulator + paired launch-tile passes for AMDGCN
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-08-26
+- **Files:**
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.h` (+2)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.td` (+89)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CMakeLists.txt` (+2)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/SyrkRegisterAccumulator.cpp` (new, +356)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/SyrkRegisterTile.cpp` (new, +539)
+  - `mlir-sycl/test/Transforms/syrk-register-accumulator.mlir` (new, +71)
+  - `mlir-sycl/test/Transforms/syrk-register-tile.mlir` (new, +81)
+  - `mlir-sycl/tools/sycl-mlir-opt/CMakeLists.txt` (+1)
+  - `mlir-sycl/tools/sycl-mlir-opt/sycl-mlir-opt.cpp` (+2)
+  - `polygeist/tools/cgeist/Options.h` (+18)
+  - `polygeist/tools/cgeist/driver.cc` (+12)
+  - `llvm/include/llvm/SYCLLowerIR/SYCLRewriteSyrkRange.h` (new, +62)
+  - `llvm/lib/SYCLLowerIR/SYCLRewriteSyrkRange.cpp` (new, +197)
+  - `llvm/lib/SYCLLowerIR/CMakeLists.txt` (+1)
+  - `llvm/lib/Passes/PassBuilder.cpp` (+1)
+  - `llvm/lib/Passes/PassRegistry.def` (+1)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-syrk-range.ll` (new, +59)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-syrk-range-noop.ll` (new, +30)
+  - `clang/include/clang/Basic/LangOptions.def` (+1)
+  - `clang/include/clang/Driver/Options.td` (+3)
+  - `clang/lib/CodeGen/BackendUtil.cpp` (+11)
+  - `doc/COMMIT_HISTORY.md` (this entry)
+
+Three off-by-default passes for the baseline polybench `Syr2k2` (`polybench/syrk.cpp`) kernel under `amdgcn-amd-amdhsa-syclmlir`, staged after the `CovarianceLoopReorderPass` template. Two are device-only MLIR passes in `mlir-sycl`; the third is a host LLVM pass in `llvm/lib/SYCLLowerIR/` that pairs with the second device pass to reproduce `polybench/orise/syrk_opt.cpp`'s source-level win (an 8×8 register micro-kernel per work-item plus a `range<2>(N,N)` → `range<2>(ceil(N/8), ceil(N/8))` launch-grid shrink) without touching benchmark source.
+
+The baseline `Syr2k2` kernel launches one work-item per output cell via `parallel_for(range<2>(N,N), item<2>(2), …)`; each item does `C[item]*=beta; for k: C[item]+=alpha*A[{i,k}]*A[{j,k}]` as a per-`k` read-modify-write on `C[item]`, with `k` kept in a stack slot (`scf.while` + `llvm.store …%slot`). A device pass cannot change the launch *size* (the host-side `range` is the wall — see the `m4-host-launch-not-device-pass-feasible` analysis), so the full `syrk_opt` win — whose arithmetic-intensity gain (0.5 → 4.0 FMA/load) depends on each item owning an 8×8 tile, which in turn depends on the shrunk grid — is unreachable from a device pass alone. The two device passes capture, respectively, the device-feasible subset (single-C-RMW promotion) and the device half of the full win (the 8×8 tile, with the host pass supplying the missing grid shrink).
+
+### `SyrkRegisterAccumulatorPass` (`-sycl-syrk-register-accumulator`)
+
+Stage-1, standalone device-only. Rewrites the `Syr2k2` lambda body **in place** (no signature change, no `nd_item`, no host change, no work-groups, no local memory) to a register-accumulator form: hoist `i=item.get_id(0)`, `j=item.get_id(1)`, and the `M` bound out of the loop; convert the `k` `scf.while` into an `scf.for` carrying a single `f32` accumulator seeded with `C[{i,j}]*beta`; one global read of `C` and one global write of `C` after the loop (vs the baseline's per-`k` RMW). Reads the real 2-arg baseline signature directly: `arg0` = captured struct `memref<?x!llvm.struct<(i64, rw_acc, r_acc)>>` (member 0 = M bound i64, member 1 = C accessor, member 2 = A accessor) projected via `polygeist::SubIndexOp`, `arg1` = `!sycl_item_2_`. The `k`-summation order is preserved (`0..M`) and the FMA operands are bit-identical, so the result is bit-identical FP to the baseline.
+
+**Outcome:** GPU-verified correct on gfx906 (Verify PASS both ON/OFF) but **net-neutral** on performance (OFF median 0.116 s vs ON median 0.115 s at size 1024, within ~0.002 s stddev). The LLVM backend already promotes the per-`k` `C[item]` RMW to a register PHI, so the transform adds nothing on top — confirming the `polybench-pass-d-net-negative` finding for syrk specifically. Kept as a commitable, correctness-preserving, off-by-default scaffold.
+
+### `SyrkRegisterTilePass` (`-sycl-syrk-register-tile`) + `SYCLRewriteSyrkRangePass` (`-fsycl-rewrite-syrk-range`)
+
+The paired host+device optimization that actually captures the `syrk_opt` win. The device pass rewrites the `Syr2k2` body so each work-item computes the 8×8 register tile at `(bi, bj) = (item.get_id(0)*8, item.get_id(1)*8)`: seed `regC[a][b] = C[{bi+a,bj+b}]*beta` (one global read per cell), `scf.for %k=0..M` of 64 `math.fma` into `regC`, then one predicated store per cell. No LDS, no barrier, no cooperative loading — a faithful port of `syrk_opt`'s algorithm. The host pass shrinks the launch grid by rewriting the two `store i64` into the `%UserRange` alloca of `parallel_for_lambda_impl` to `ceil(V/8) = (V+7) udiv 8`.
+
+**`SYCLRewriteSyrkRange.cpp`** (host) — a `PassInfoMixin` module pass registered as `sycl-rewrite-syrk-range`, hooked into `EmitAssemblyHelper::RunOptimizationPipeline` at `PipelineStartEP` (before AlwaysInliner/SROA, where the `__SYCL_ALWAYS_INLINE` handler code is still in its own `parallel_for_lambda_impl` function and the range alloca stores are intact), gated on `LangOpts.SYCLIsHost && LangOpts.SYCLRewriteSyrkRange`. The launch site is identified by (1) a call/invoke of `getRoundedRangeILi2EE` (the 2-D `parallel_for` range entry; `syrk.cpp` has exactly one) whose two i64 arguments are loads from a common alloca, and (2) the kernel-name anchor: a private string constant `_ZTS6Syr2k2` (from `__builtin_sycl_unique_stable_name(Syr2k2)`) somewhere in the module. At `PipelineStartEP` the call's loads typically read a temporary copy (`%agg.tmp11`) filled by a `memcpy` from the real `%UserRange` alloca; the pass traces that memcpy back to the origin and rewrites the origin's two i64 stores to `ceil(V/8)`, so every downstream consumer (`getRoundedRange` args, the range-rounding wrapper's `UserRange` member, `checkValueRange`, `MNDRDesc.set`→`GlobalSize`) sees the shrunk range — exactly source-equivalent to writing `range<2>(ceil(N/8), ceil(N/8))`. Safe no-op if either anchor does not match. Limitation: no-ops if range rounding was compiled out (`-fsycl-disable-range-rounding`, also auto-added at `-O0`); the benchmark builds at `-O3`.
+
+**`SyrkRegisterTile.cpp`** (device) — two rewrite sites, because the cgeist frontend emits the `Syr2k2` body in two places with different consumers:
+- **Site 1 — `func.func` (the wrapper path):** the top-level lambda body `(memref<?x!llvm.struct<(i64, rw_acc, r_acc)>>, !sycl_item_2_)`. `gpu.func @__pf_kernel_wrapperI6Syr2k2EE` calls it once per enumerated user item (the `RoundedRangeIDGenerator` loop), later inlined into `RoundedRangeKernel::operator()`. The ONLY path exercised when range rounding fires. The whole body is wiped (reverse-erase) and rebuilt via the shared `emitTileBody`.
+- **Site 2 — `gpu.func @_ZTS6Syr2k2` (the direct kernel):** body born **inlined** from the frontend (it never calls the `func.func`). The path exercised when NO rounding is needed — the common case, and the case the paired host pass produces (`ceil(N/8)` is usually already local-size divisible). Without this site the host pass would shrink the launch while the direct kernel still ran the baseline single-cell body → 1/64 of C computed, wrong results (this was the root cause of an earlier Verify FAIL). `rewriteDirectKernel` keeps the entry-block prologue (kernel-arg → captured-struct reassembly via the `polygeist::Pointer2MemrefOp` result typed `memref<?x!llvm.struct<(i64, rw_acc, r_acc)>>` plus the accessor `__init`), locates the zero-operand `sycl.call @getItem` (the work-item), erases everything after it, and appends `emitTileBody` + `gpu.return`.
+
+- **regC representation (the iteration-costing gotcha, documented in source):** `regC` is a `memref<8x8xf32,5>` (private AS 5) alloca at **function scope** (not inside the guard), and every regC access uses a **constant** index — the 8×8 seed / k-body / store bodies are **fully unrolled**, leaving only the `k`-loop as a loop. This mirrors the `syrk_opt` kernel's machine code (64 `v_fma`, ~80 global loads, zero private-memory accesses). A loop-nest form lowers to a `[64 x float]` alloca with loop-variable GEP indices; LLVM's `AMDGPUPromoteAlloca::tryPromoteAllocaToVector` rejects arrays > 16 elements and SROA cannot partition variable-index accesses, so the accumulators would live in scratch memory (measured: 410 buffer ops per kernel — pathological, and the cause of an earlier Verify-hang). With constant indices, SROA slices `regC` into 64 scalar registers.
+- **No `reqd_work_group_size`:** each work-item is now an independent tile, so any work-group shape is valid and `LocalSize` stays auto. An earlier iteration tried annotating `reqd_work_group_size [8,1,8]` on the wrapper kernel; that path was abandoned because amdgcn HSA metadata requires a 3-element array while the SYCL runtime's `program_manager` dimension check requires the element count to match the 2-D launch — an irreconcilable conflict that gets any `reqd` value rejected at launch.
+- **Fail-safe guard:** the tile computation is wrapped in `if (bi < M && bj < M)`. In paired mode (host pass fired) the launch is `ceil(N/8)×ceil(N/8)` and the guard is dead. If the host pass did not fire (launch still `N×N`), items with id ≥ `ceil(N/8)` exit immediately and every tile is still computed exactly once by the item whose id IS the tile index — correct for any launch size, merely not faster.
+- **Edge handling for N % 8 ≠ 0:** loads use a clamped index (`min(idx, M-1)`, safe, garbage into discarded cells); stores are predicated per cell (`bi+a < N && bj+b < N`). Out-of-range `regC` cells are computed but never stored.
+
+### Wiring
+
+- **`Passes.td` / `Passes.h`** declare both device passes (`-sycl-syrk-register-accumulator`, `-sycl-syrk-register-tile`; `ModuleOp`; `num-detected`/`num-rewritten` statistics; the usual `arith`/`memref`/`affine`/`gpu`/`scf`/`math`/`func` dependent dialects) and their factories. `Transforms/CMakeLists.txt` adds both sources.
+- **`sycl-mlir-opt`** gains `MLIRPolygeistDialect` (CMake link + `registry.insert` + header include) because both passes use `polygeist::SubIndexOp` / `polygeist::Pointer2MemrefOp`. (The covariance pass needs none of this — it uses only SYCL-dialect attrs/ops.)
+- **`Options.h` / `driver.cc`** add `--sycl-syrk-register-accumulator` and `--sycl-syrk-register-tile` (off by default), each adding the pass + a canonicalize/CSE pair to `PM` alongside the existing fusion/inline/covariance blocks.
+- **Host pass wiring:** `LangOptions.def` adds `SYCLRewriteSyrkRange`; `Options.td` adds `-fsycl-rewrite-syrk-range` (cc1-only, marshalled to that langopt); `BackendUtil.cpp` registers it at `PipelineStartEP` gated on `SYCLIsHost && SYCLRewriteSyrkRange`; `PassBuilder.cpp` + `PassRegistry.def` register `sycl-rewrite-syrk-range`; `llvm/lib/SYCLLowerIR/CMakeLists.txt` adds the source.
+
+### Lit tests
+
+- **`sycl-register-accumulator.mlir` / `sycl-register-tile.mlir`** (`sycl-mlir-opt -split-input-file -sycl-{...} -mlir-pass-statistics`) — lock in the `Syr2k2` detection anchor, gate #2 (the `amdgcn-amd-amdhsa-syclmlir` triple guard; a `spir64` chunk is a no-op), and the signature-validation guard (non-matching body → `num-detected=1`/`num-rewritten=0`, body preserved). The full rewrite targets the real `Syr2k2` body whose captured-struct arg is `memref<?x!llvm.struct<…>>`, which `sycl-mlir-opt`'s asm parser rejects as a memref element type ("invalid memref element type") — a parser limitation, not a pass bug; the production cgeist/clang pipeline consumes that exact type and the full `-fsycl` build links cleanly. The full rewrite is therefore verified out-of-tree via the cgeist IR dump and the gfx906 GPU run (the test headers document this). The tile test additionally pins the two rewrite sites (wrapper `func.func` + direct `gpu.func @_ZTS6Syr2k2`).
+- **`sycl-rewrite-syrk-range.ll`** (positive, `opt -passes=sycl-rewrite-syrk-range -S`) — the real `PipelineStartEP` shape: the `getRoundedRangeILi2EE` call's two i64 args load from a temporary `%agg.tmp11` filled by a memcpy from `%UserRange`; asserts the pass traces the memcpy back and rewrites `%UserRange`'s two stores to `(V+7) udiv 8`. **`sycl-rewrite-syrk-range-noop.ll`** (negative) — same launch-site shape but no `_ZTS6Syr2k2` string anchor → no-op.
+
+### GPU results (gfx906, size 1024, `--local=256 --num-runs=10`, DTK 25.04.1 runtime)
+
+- **Register-accumulator:** OFF median 0.116 s / ON median 0.115 s → net-neutral, Verify PASS both.
+- **Launch-tile (paired host+device):** OFF median 0.127 s / ON median 0.095 s → **1.34×**, Verify PASS. `syrk_opt` source-level reference measured 0.083 s (1.53×) same session → the pass pair captures ~88% of the source-level win, with zero benchmark-source changes. N%8≠0 sanity (size 1030): PASS (ceil-div launch + partial tiles + per-cell predication + rounding path all correct). Disassembly of the tile kernel: 0 private-scratch buffer ops, 64 `v_fma`, ~80 global loads — byte-shape match with `syrk_opt`'s winner. Bench wiring (`sycl-bench` `SYRK_REGISTER_ACCUMULATOR` / `SYRK_LAUNCH_TILE` options + the per-target `-Xcgeist` / `-Xclang -fsycl-rewrite-syrk-range` flags) lives outside this repo and is not included here.
+
+Two sharp edges worth flagging: (1) the launch-tile win is **paired** — the device pass alone, with the host pass disabled, is a silent no-op on the live path at N=1024 (no rounding fires, the direct kernel runs the baseline body), so the two passes must be enabled together (`SYRK_LAUNCH_TILE` does this); enabling only the device pass is correctness-preserving (the fail-safe guard keeps every tile computed exactly once) but gives no speedup. (2) `regC` as `memref<8x8xf32,5>` is only register-promoted because every access uses a constant index (full 8×8 unroll); a future "parametrize the tile size" change that made the regC indices variable would silently regress to the 410-buffer-op scratch-memory pathology, and `AMDGPUPromoteAlloca`'s >16-element rejection caps any such parametrisation at ≤16 anyway.
+
+End-to-end effect: a `Syr2k2` kernel compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-syrk-register-tile -Xclang -fsycl-rewrite-syrk-range` now runs an 8×8 register-tiled body on a `ceil(N/8)×ceil(N/8)` launch, giving 1.34× on gfx906 at size 1024 with Verify PASS and bit-identical results; the register-accumulator pass is available standalone as a correctness-preserving net-neutral rewrite. Both off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
+
+---

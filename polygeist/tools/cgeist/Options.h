@@ -167,6 +167,24 @@ static llvm::cl::opt<bool> EnableCovarianceLoopReorder(
                    "register-blocked j2 loop hoisting the column-j1 load "
                    "(amdgcn-amd-amdhsa-syclmlir target only)"));
 
+static llvm::cl::opt<bool> EnableSyrkRegisterAccumulator(
+    "sycl-syrk-register-accumulator", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite the polybench Syr2k2 kernel: promote the per-k "
+                   "C[item] read-modify-write to a register accumulator "
+                   "(single C read/write), convert scf.while->scf.for, and "
+                   "hoist i/j/M (amdgcn-amd-amdhsa-syclmlir target only)"));
+
+static llvm::cl::opt<bool> EnableSyrkRegisterTile(
+    "sycl-syrk-register-tile", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite the polybench Syr2k2 kernel so each work-item "
+                   "computes the 8x8 register tile at (item_id*8, item_id*8) "
+                   "(no LDS/barrier/reqd_work_group_size). Pair with the host "
+                   "LLVM pass SYCLRewriteSyrkRange "
+                   "(-fsycl-rewrite-syrk-range), which shrinks the launch to "
+                   "ceil(N/8) x ceil(N/8); a fail-safe guard keeps the body "
+                   "correct if the host pass does not fire. "
+                   "amdgcn-amd-amdhsa-syclmlir target only"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

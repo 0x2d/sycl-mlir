@@ -66,6 +66,7 @@ add_llvm_component_library(LLVMSYCLLowerIR
   SYCLAddOptLevelAttribute.cpp
   SYCLPropagateAspectsUsage.cpp
   SYCLPropagateJointMatrixUsage.cpp
+  SYCLRewriteSyrkRange.cpp
   SYCLUtils.cpp
 
   LocalAccessorToSharedMemory.cpp
