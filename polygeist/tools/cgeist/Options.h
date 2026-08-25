@@ -161,6 +161,12 @@ static llvm::cl::opt<bool>
     EnableFusionPass("sycl-fusion", llvm::cl::init(true),
                      llvm::cl::desc("Run the SYCL kernel fusion pass"));
 
+static llvm::cl::opt<bool> EnableCovarianceLoopReorder(
+    "sycl-covariance-loop-reorder", llvm::cl::init(false),
+    llvm::cl::desc("Reorder the polybench CovarianceCovar kernel: "
+                   "register-blocked j2 loop hoisting the column-j1 load "
+                   "(amdgcn-amd-amdhsa-syclmlir target only)"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

@@ -83,4 +83,43 @@ def InlinePass : Pass<"inliner"> {
   ];
 }
 
+def CovarianceLoopReorderPass
+    : Pass<"sycl-covariance-loop-reorder", "::mlir::ModuleOp"> {
+  let summary = "Reorder the polybench covariance covar kernel (loop-reorder + column-j1 cache)";
+  let description = [{
+    A device-only optimization of the baseline polybench `CovarianceCovar`
+    lambda body. The baseline launches one work-item per column `j1` (a
+    `range<1>` host launch that a device pass cannot change) and each item
+    serially loops `j2` then `i`, reloading column `j1` ~`(M-j1+1)` times from
+    global memory. This pass rewrites the body in place (no signature change, no
+    `nd_item`, no host change) to a register-blocked loop reorder: an outer
+    `j2`-block loop of width `tile-size` carrying `tile-size` f32 accumulators,
+    with the `i` loop inside and the column-`j1` load hoisted out of the `j2`
+    unroll, cutting column-`j1` global traffic by ~`tile-size`x. The per-`j2`
+    `i`-summation order is preserved, so the result is bit-identical to the
+    baseline. The dead `symmat[j1,j1]=1.0` store is dropped (overwritten by the
+    variance sum); the mirror store through `symmat2` is preserved.
+
+    Gated on two conditions, both of which must hold: (1) the opt-in
+    `--sycl-covariance-loop-reorder` flag (off by default), and (2) the
+    module's `llvm.target_triple` attribute must equal
+    `amdgcn-amd-amdhsa-syclmlir`. On any other target the pass is a no-op.
+  }];
+  let options = [
+    Option<"TileSize", "tile-size", "unsigned", /*default=*/"16",
+           "j2-block width B (number of register accumulators)">,
+  ];
+  let constructor = "mlir::sycl::createCovarianceLoopReorderPass()";
+  let dependentDialects = ["arith::ArithDialect", "memref::MemRefDialect",
+                            "affine::AffineDialect", "gpu::GPUDialect",
+                            "scf::SCFDialect", "math::MathDialect",
+                            "func::FuncDialect"];
+  let statistics = [
+    Statistic<"NumDetected", "num-detected",
+              "Number of CovarianceCovar bodies detected">,
+    Statistic<"NumRewritten", "num-rewritten",
+              "Number of CovarianceCovar bodies rewritten to reordered form">,
+  ];
+}
+
 #endif // MLIR_DIALECT_SYCL_TRANSFORMS_PASSES

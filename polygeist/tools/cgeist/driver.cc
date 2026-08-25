@@ -516,6 +516,12 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
       PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
       PM.addPass(mlir::createCSEPass());
     }
+
+    if (EnableCovarianceLoopReorder) {
+      PM.addPass(sycl::createCovarianceLoopReorderPass());
+      PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+      PM.addPass(mlir::createCSEPass());
+    }
   }
  
   if (PrintPipeline) {

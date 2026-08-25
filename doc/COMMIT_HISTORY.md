@@ -489,3 +489,47 @@ End-to-end effect: a SYCL kernel with ≥2 local accessors compiled with `-fsycl
 
 ---
 
+## [SYCL-MLIR] Add CovarianceLoopReorderPass (device-only loop-reorder of the polybench covar kernel)
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-08-26
+- **Files:**
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.h` (+1)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.td` (+39)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CMakeLists.txt` (+1 / -1)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CovarianceLoopReorder.cpp` (new, +344)
+  - `mlir-sycl/test/Transforms/covariance-loop-reorder.mlir` (new, +86)
+  - `polygeist/tools/cgeist/Options.h` (+6)
+  - `polygeist/tools/cgeist/driver.cc` (+6)
+  - `doc/COMMIT_HISTORY.md` (this entry)
+
+Stage-1 of the staged covariance device-only optimization plan. A new `-sycl-covariance-loop-reorder` MLIR pass that rewrites the baseline polybench `CovarianceCovar` lambda body **in place** — no signature change, no `nd_item`, no host/launch change, no work-groups, no local memory — into a register-blocked loop reorder that cuts the dominant global-memory traffic. Off by default; gated to the `amdgcn-amd-amdhsa-syclmlir` device target.
+
+- **Why this shape.** The baseline `CovarianceCovar` kernel launches one work-item per column `j1` via a `parallel_for(range<1>(size), id<1>(1), …)` host launch. A device pass cannot change that launch *size* (the host-side `range` is the wall — see the `m4-host-launch-not-device-pass-feasible` analysis), so the full `covariance_opt` tiled-GEMM win (547×) is unreachable from a pass. What a pass *can* do is restructure the per-item serial loop: the baseline loops `j2 ∈ [j1..M]` then `i ∈ [1..N]`, reloading column `j1` ~`(M-j1+1)` times from global memory. Hoisting that column-`j1` load out of the `j2` unroll captures bandwidth, not occupancy — a modest, real speedup rather than the 547×.
+
+- **`CovarianceLoopReorder.cpp`** — the pass. Walks the module for `func::FuncOp`s whose `sycl.kernel_func_obj` ArrayAttr references a symbol containing `"CovarianceCovar"` (the dispatching `gpu.func @_ZTS15CovarianceCovar`; the substring uniquely excludes `CovarianceMean` / `CovarianceReduce`). For each matched body it calls `rewriteBodyReorder`, which wipes the entry block and rebuilds the compute from scratch (block arguments / function args are kept). Reads the real 6-arg baseline signature directly: `arg0`/`arg1` = M/N as `memref<?xi64>`, `arg2` = `symmat` discard-write, `arg3` = `data` read, `arg4` = `symmat2` discard-write (the mirror), `arg5` = `!sycl_item_1_`. Emits:
+  - `j1 = sycl.item.get_id(item, 0)` (i64 → `index_cast`), M/N via `memref.load arg{M,N}[0]` → `index_cast`. `scf.for` is half-open, so the `j2 ≤ M` / `i ≤ N` baseline bounds become `j2 < M+1` / `i < N+1`.
+  - Outer `scf.for %j2b = j1 to M+1 step B` (B = `tile-size`, default 16), no iter_args.
+  - Inner `scf.for %i = 1 to N+1` carrying `B` f32 `iter_args` (init 0.0). Column `j1` is loaded **once per `i`** (`data[i, j1]`, hoisted out of the `jj` unroll); each `jj ∈ [0,B)` computes `j2 = j2b+jj`, clamps the data subscript to `min(j2, M)` (so the tail of the last block never issues an OOB accessor subscript), and folds `fma(a, data[i, min(j2,M)], acc[jj])` guarded by `arith.select(j2 ≤ M, fma, acc[jj])` so the tail of the last block is skipped rather than accumulated.
+  - After the `i`-loop, the `B` accumulators are stored guarded by `scf.if(j2 ≤ M)`: the upper cell `symmat[j1, j2]` via `arg2`, the mirror `symmat2[j2, j1]` via `arg4`. `j2 == j1` (the diagonal) writes the same cell twice, matching the baseline mirror of the `j2=j1` iteration.
+  - Accessor subscripts are built with `mkId`/`loadData`/`storeSym` helpers (`sycl.id.constructor` + `sycl.accessor.subscript` + `memref.load`/`store`), all copied from the sibling `CovarianceTiledGEMM.cpp`'s idiom. The dead `symmat[j1,j1] = 1.0` store is dropped (overwritten by the `j2=j1` variance sum; the CPU reference `covariance()` does not set 1.0 either).
+  - **Correctness:** for each `j2` the accumulator is summed over `i` in the *same* `1..N` order as the baseline — only the `j2` loop is reordered/blocked — so the result is bit-identical FP to the baseline. Whatever offset behavior the baseline has (cf. the `rocdl_global_offset_hardcoded_zero` known issue) is inherited unchanged: `j1` is still `sycl.item.get_id`, bounds still `1..N` / `j1..M`, accessor subscripts still take the 1-based logical index directly.
+
+- **Two gates, both load-bearing.** (1) the opt-in `--sycl-covariance-loop-reorder` flag (off by default, wired in cgeist `driver.cc` where the pass is only added to the pipeline when set), and (2) the module's `llvm.target_triple` attribute must equal `amdgcn-amd-amd-hsa-syclmlir`. The in-pass target guard is necessary because the pass can also be reached via `polygeist-opt` / lit, where the driver flag is absent; on any other target the pass is a no-op. `sycl.kernel_func_obj` is a SYCL-dialect attribute (`SYCLBase.td::getKernelFuncObjAttrName`), so the pass needs no Polygeist dialect — `sycl-mlir-opt` registers only `SYCLDialect`.
+
+- **Two gotchas that cost iteration (documented in the source):**
+  1. **Body wipe must erase top-level ops in REVERSE program order** (`for (op : reverse(topOps)) op->erase()`), not `Block::getOperations().clear()` (forward-order destroy trips "operation destroyed but still has uses" on the non-trivial baseline body — only worked on the trivial `{return}` lit body) and not a `walk`-based erase (double-free: nested ops erased both explicitly and via their parent). Non-entry blocks are dropped after.
+  2. **The 2-D id payload MUST be the array form `!sycl.id<[2], (!sycl.array<[2], (memref<2xi64>)>)>`** (the `!sycl_id_2_` spelling the baseline emits), not `!sycl.id<[2], (i64)>`. The `(i64)` form verifies in `sycl-mlir-opt`/lit *and* in `cgeist -emit-mlir` (the `sycl.accessor.subscript` verifier only checks id dim == accessor dim), but fails phase-3 (`-c`/binary) with `'llvm.getelementptr' op type 'i64' cannot be indexed (index #2)` / `Finalize failed (phase 3)`: `AccessorSubscriptIDIndexPattern::getLinearIndex` (DPCPP.cpp) does `Res = Res*Mem[I] + Id[I]` GEPing `Id[I]` per dim, and `IDIndexConstructorPattern` stores args via `SYCLIDGetOp` — both GEP the id payload, which only works when it is the indexable 2-element array.
+
+- **Wiring.** `Passes.td` declares `CovarianceLoopReorderPass` (`-sycl-covariance-loop-reorder`, `ModuleOp`, `tile-size` option default 16, `num-detected`/`num-rewritten` statistics, the usual `arith`/`memref`/`affine`/`gpu`/`scf`/`math`/`func` dependent dialects); `Passes.h` declares `createCovarianceLoopReorderPass()`; `Transforms/CMakeLists.txt` adds the source (and drops a stale trailing-whitespace on the `MLIRTransforms` link line); `Options.h` adds `EnableCovarianceLoopReorder`; `driver.cc` adds the pass + a canonicalize/CSE pair to `PM`, gated on the flag, alongside the existing fusion/inline blocks.
+
+- **`covariance-loop-reorder.mlir`** (lit) — `sycl-mlir-opt -split-input-file -sycl-covariance-loop-reorder -mlir-pass-statistics`. Two chunks exercising both gates: an `amdgcn-amd-amdhsa-syclmlir` chunk (both gates pass → 1 detected / 1 rewritten, and the rewritten body carries the reorder shape — `sycl.item.get_id`, outer `scf.for`, inner `scf.for` with 16 f32 `iter_args`, hoisted `sycl.accessor.subscript` data load, `math.fma`, `arith.select` tail guard, upper + mirror stores), and a `spir64-unknown-unknown-syclmlir` chunk with the same anchor (gate #2 fails → 0 / 0, body untouched). Type aliases are taken verbatim from the cgeist-lowered `covariance.cpp` IR.
+
+- **GPU results (gfx906, size 1024, `--local=256 --num-runs=10`, DTK 25.04.1 runtime):** baseline (pass OFF) median 1.060 s, Verify PASS; loop-reorder (pass ON) median 0.214 s, Verify PASS → ~5×. (`covariance_opt` full tiled GEMM is 0.0019 s → 547×, unreachable via pass — host-launch wall.) Bench wiring (`sycl-bench` `COVARIANCE_LOOP_REORDER` option + `-Xcgeist --sycl-covariance-loop-reorder`) lives outside this repo and is not included here.
+
+Two sharp edges worth flagging: (1) the per-`j2` `i`-summation order is preserved so the transform is bit-identical FP, but the `j2` loop is *blocked* (`j2b`, `j2b+1`, … `j2b+B-1` per outer iteration) rather than strictly sequential — within a block the `B` accumulators are independent by construction, so this does not change any `i`-sum, but a future stricter FP-identity requirement (strict `j2` order across blocks) would need the block stride reconsidered; (2) `tile-size` is a compile-time constant baked into the IR as `B` separate `iter_args` / unrolled `jj` ops — a large `tile-size` inflates the IR (and register pressure) linearly, and AMDGPU `promote-alloca` rejects arrays > 16 elements, which is why the default is 16 and the accumulators are emitted as distinct `iter_args` rather than a `memref<16xf32>`.
+
+End-to-end effect: a `CovarianceCovar` kernel compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-covariance-loop-reorder` now lowers the per-item body to a register-blocked loop reorder with the column-`j1` load hoisted out of the `j2` unroll, giving ~5× on gfx906 at size 1024 with bit-identical results and Verify PASS. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before. Stage-2 (1-D LDS tiling via grid ops, de-risked on a tiny kernel first) is not started.
+
+---
+
