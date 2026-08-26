@@ -40,6 +40,7 @@ std::unique_ptr<Pass> createInlinePass(const InlinePassOptions &options);
 std::unique_ptr<Pass> createCovarianceLoopReorderPass();
 std::unique_ptr<Pass> createSyrkRegisterAccumulatorPass();
 std::unique_ptr<Pass> createSyrkRegisterTilePass();
+std::unique_ptr<Pass> createSyr2kRegisterTilePass();
 
 //===----------------------------------------------------------------------===//
 // Registration

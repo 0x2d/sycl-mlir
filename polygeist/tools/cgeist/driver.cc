@@ -534,6 +534,12 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
       PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
       PM.addPass(mlir::createCSEPass());
     }
+
+    if (EnableSyr2kRegisterTile) {
+      PM.addPass(sycl::createSyr2kRegisterTilePass());
+      PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+      PM.addPass(mlir::createCSEPass());
+    }
   }
  
   if (PrintPipeline) {

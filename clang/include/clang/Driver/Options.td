@@ -8126,6 +8126,9 @@ def fsycl_disable_range_rounding : Flag<["-"], "fsycl-disable-range-rounding">,
 def fsycl_rewrite_syrk_range : Flag<["-"], "fsycl-rewrite-syrk-range">,
   HelpText<"Rewrite the Syr2k2 parallel_for launch range to ceil(N/8) per dim (register-tile co-optimization).">,
   MarshallingInfoFlag<LangOpts<"SYCLRewriteSyrkRange">>;
+def fsycl_rewrite_syr2k_range : Flag<["-"], "fsycl-rewrite-syr2k-range">,
+  HelpText<"Rewrite the Syr2k1 parallel_for launch range to ceil(N/8) per dim (register-tile co-optimization).">,
+  MarshallingInfoFlag<LangOpts<"SYCLRewriteSyr2kRange">>;
 def fsycl_enable_int_header_diags: Flag<["-"], "fsycl-enable-int-header-diags">,
   HelpText<"Enable diagnostics that require the SYCL integration header.">,
   MarshallingInfoFlag<LangOpts<"SYCLEnableIntHeaderDiags">>;

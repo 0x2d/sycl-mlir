@@ -211,4 +211,53 @@ def SyrkRegisterTilePass
   ];
 }
 
+def Syr2kRegisterTilePass
+    : Pass<"sycl-syr2k-register-tile", "::mlir::ModuleOp"> {
+  let summary = "Rewrite the polybench Syr2k1 kernel so each work-item computes the 8x8 register tile at (item_id*8, item_id*8) (no LDS/barrier/reqd_work_group_size); pair with the host LLVM pass SYCLRewriteSyr2kRange which shrinks the launch to ceil(N/8) x ceil(N/8)";
+  let description = [{
+    Device-side half of the launch-grid-shrinking SYR2K optimization (a
+    per-benchmark sibling of sycl-syrk-register-tile, distinguished purely by
+    the kernel anchor -- Syr2k1 here vs Syr2k2 there -- so the two passes
+    never cross-fire). The source-level polybench/orise/syr2k_opt.cpp win is
+    an 8x8 register micro-kernel per work-item plus a host-side launch-grid
+    shrink range<2>(N,N) -> range<2>(ceil(N/8), ceil(N/8)). This pass
+    rewrites the device body so each work-item computes the 8x8 regC tile
+    whose origin is its own item id (bi = item.get_id(0)*8, bj =
+    item.get_id(1)*8): seed C*beta (one global read per cell), k loop loading
+    16 values per iteration (rows bi+a of A and B, columns bj+b of A and B)
+    feeding 2 FMAs per cell (the A*B^T term and the B*A^T term), single
+    guarded store per cell. No LDS, no barrier, no cooperative loading, no
+    reqd_work_group_size (LocalSize stays auto) -- a faithful port of
+    syr2k_opt's algorithm. The captured struct has FOUR members (i64 M_,
+    C read_write, A read, B read). The launch-grid shrink itself is
+    host-side and is performed by the paired LLVM pass SYCLRewriteSyr2kRange
+    (-fsycl-rewrite-syr2k-range); a fail-safe guard (bi < M && bj < M) keeps
+    the device body correct even if the host pass does not fire (launch
+    still N x N: every tile is still computed exactly once, merely not
+    faster). TWO rewrite sites are needed because the cgeist frontend emits
+    the Syr2k1 body twice: (1) the top-level lambda body func.func, called
+    per enumerated user item by the __pf_kernel_wrapper path (the only path
+    that runs when range rounding fires), and (2) the DIRECT kernel
+    gpu.func @_ZTS6Syr2k1 whose body is born inlined from the frontend (the
+    path that runs when no rounding is needed -- the common case for the
+    shrunk launch). The 8x8 seed/fma/store bodies are fully unrolled with
+    constant regC indices so that SROA promotes the 64 accumulator cells to
+    scalar registers (AMDGPU promote-alloca rejects arrays > 16 elements, so
+    a loop-nest form leaves the accumulators in scratch memory).
+    Gated on (1) --sycl-syr2k-register-tile (off) and (2)
+    llvm.target_triple == amdgcn-amd-amdhsa-syclmlir.
+  }];
+  let constructor = "mlir::sycl::createSyr2kRegisterTilePass()";
+  let dependentDialects = ["arith::ArithDialect", "memref::MemRefDialect",
+                            "affine::AffineDialect", "gpu::GPUDialect",
+                            "scf::SCFDialect", "math::MathDialect",
+                            "func::FuncDialect"];
+  let statistics = [
+    Statistic<"NumDetected", "num-detected",
+              "Number of Syr2k1 bodies detected">,
+    Statistic<"NumRewritten", "num-rewritten",
+              "Number of Syr2k1 bodies rewritten to register-tile form">,
+  ];
+}
+
 #endif // MLIR_DIALECT_SYCL_TRANSFORMS_PASSES

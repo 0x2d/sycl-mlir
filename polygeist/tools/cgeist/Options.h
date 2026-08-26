@@ -185,6 +185,18 @@ static llvm::cl::opt<bool> EnableSyrkRegisterTile(
                    "correct if the host pass does not fire. "
                    "amdgcn-amd-amdhsa-syclmlir target only"));
 
+static llvm::cl::opt<bool> EnableSyr2kRegisterTile(
+    "sycl-syr2k-register-tile", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite the polybench Syr2k1 kernel so each work-item "
+                   "computes the 8x8 register tile at (item_id*8, item_id*8) "
+                   "(no LDS/barrier/reqd_work_group_size); per k, 16 loads "
+                   "feed 2 FMAs per cell (the A*B^T and B*A^T terms). Pair "
+                   "with the host LLVM pass SYCLRewriteSyr2kRange "
+                   "(-fsycl-rewrite-syr2k-range), which shrinks the launch to "
+                   "ceil(N/8) x ceil(N/8); a fail-safe guard keeps the body "
+                   "correct if the host pass does not fire. "
+                   "amdgcn-amd-amdhsa-syclmlir target only"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

@@ -57,6 +57,7 @@
 #include "llvm/SYCLLowerIR/SYCLPropagateAspectsUsage.h"
 #include "llvm/SYCLLowerIR/SYCLPropagateJointMatrixUsage.h"
 #include "llvm/SYCLLowerIR/SYCLRewriteSyrkRange.h"
+#include "llvm/SYCLLowerIR/SYCLRewriteSyr2kRange.h"
 #include "llvm/Support/BuryPointer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -973,6 +974,15 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       PB.registerPipelineStartEPCallback(
           [&](ModulePassManager &MPM, OptimizationLevel Level) {
             MPM.addPass(SYCLRewriteSyrkRangePass());
+          });
+
+    // Host-side launch-range rewrite for the syr2k benchmark kernel, paired
+    // with the device-side MLIR pass `sycl-syr2k-register-tile` (cgeist).
+    // Runs at PipelineStartEP for the same reason as the syrk hook above.
+    if (LangOpts.SYCLIsHost && LangOpts.SYCLRewriteSyr2kRange)
+      PB.registerPipelineStartEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level) {
+            MPM.addPass(SYCLRewriteSyr2kRangePass());
           });
 
     // Add the InferAddressSpaces pass for all the SPIR[V] targets

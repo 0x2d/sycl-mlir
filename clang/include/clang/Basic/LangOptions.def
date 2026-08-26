@@ -281,6 +281,7 @@ LANGOPT(OffloadingNewDriver, 1, 0, "use the new driver for generating offloading
 LANGOPT(SYCLIsDevice      , 1, 0, "Generate code for SYCL device")
 LANGOPT(SYCLIsHost        , 1, 0, "SYCL host compilation")
 LANGOPT(SYCLRewriteSyrkRange, 1, 0, "Rewrite the Syr2k2 parallel_for launch range to ceil(N/8) per dim (register-tile co-optimization)")
+LANGOPT(SYCLRewriteSyr2kRange, 1, 0, "Rewrite the Syr2k1 parallel_for launch range to ceil(N/8) per dim (register-tile co-optimization)")
 LANGOPT(IntelFPGA         , 1, 0, "Perform ahead-of-time compilation for FPGA")
 LANGOPT(SYCLAllowFuncPtr  , 1, 0, "Allow function pointers in SYCL device code")
 LANGOPT(SYCLStdLayoutKernelParams, 1, 0, "Enable standard layout requirement for SYCL kernel parameters")

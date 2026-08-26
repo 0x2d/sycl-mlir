@@ -6,6 +6,7 @@ add_mlir_library(MLIRSYCLTransforms
   CovarianceLoopReorder.cpp
   SyrkRegisterAccumulator.cpp
   SyrkRegisterTile.cpp
+  Syr2kRegisterTile.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Transforms
