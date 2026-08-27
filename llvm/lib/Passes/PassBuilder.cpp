@@ -112,6 +112,7 @@
 #include "llvm/SYCLLowerIR/SYCLRewriteSyrkRange.h"
 #include "llvm/SYCLLowerIR/SYCLRewriteSyr2kRange.h"
 #include "llvm/SYCLLowerIR/SYCLRewrite2mmRange.h"
+#include "llvm/SYCLLowerIR/SYCLRewrite3mmRange.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"

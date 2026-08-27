@@ -547,6 +547,12 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
       PM.addPass(mlir::createCSEPass());
     }
 
+    if (EnableThreeMmLocalTile) {
+      PM.addPass(sycl::createThreeMmLocalTilePass());
+      PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+      PM.addPass(mlir::createCSEPass());
+    }
+
   }
  
   if (PrintPipeline) {

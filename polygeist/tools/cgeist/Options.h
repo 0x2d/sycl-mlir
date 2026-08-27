@@ -212,6 +212,21 @@ static llvm::cl::opt<bool> EnableTwoMmLocalTile(
                    "work-group shape. amdgcn-amd-amdhsa-syclmlir target "
                    "only"));
 
+static llvm::cl::opt<bool> EnableThreeMmLocalTile(
+    "sycl-3mm-local-tile", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite ALL THREE polybench 3mm kernels to the 3mm_opt "
+                   "LDS-tiled form: 16x16 work-groups cooperatively stage "
+                   "16x16 A/B tiles in local memory (rocdl.barrier between "
+                   "stages), one output cell and a scalar accumulator per "
+                   "work-item. All three kernels (E += A*B, F += C*D, "
+                   "G += E*F, all read_write) are seeded from the existing "
+                   "output. Pair with the host LLVM pass "
+                   "SYCLRewrite3mmRange (-fsycl-rewrite-3mm-range), which "
+                   "pads ALL THREE launches to ceil16(N) x ceil16(N), and "
+                   "the runtime env SYCL_FORCE_LOCAL_SIZE=16,16 which fixes "
+                   "the work-group shape. amdgcn-amd-amdhsa-syclmlir target "
+                   "only"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

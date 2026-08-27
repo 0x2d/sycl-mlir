@@ -708,3 +708,45 @@ Sharp edges: (1) the win is **paired + env-dependent** — all three pieces must
 End-to-end effect: a 2mm benchmark compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-2mm-local-tile -Xclang -fsycl-rewrite-2mm-range` and run with `SYCL_FORCE_LOCAL_SIZE=16,16` now runs both GEMM kernels as 16×16 LDS-tiled bodies on the ceil16(N)×ceil16(N) padded grid, giving 4.61× on gfx906 at size 1024 with Verify PASS and beating the source-level 2mm_opt. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
 
 ---
+
+## [SYCL-MLIR] Add 3mm local-tile pass pair for AMDGCN (device LDS-tile + host launch pad)
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-08-27
+- **Files:**
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.h` (+1)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.td` (+71)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CMakeLists.txt` (+1)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/ThreeMmLocalTile.cpp` (new, +688)
+  - `mlir-sycl/test/Transforms/3mm-local-tile.mlir` (new, +136)
+  - `polygeist/tools/cgeist/Options.h` (+15)
+  - `polygeist/tools/cgeist/driver.cc` (+6)
+  - `llvm/include/llvm/SYCLLowerIR/SYCLRewrite3mmRange.h` (new, +70)
+  - `llvm/lib/SYCLLowerIR/SYCLRewrite3mmRange.cpp` (new, +227)
+  - `llvm/lib/SYCLLowerIR/CMakeLists.txt` (+1)
+  - `llvm/lib/Passes/PassBuilder.cpp` (+1)
+  - `llvm/lib/Passes/PassRegistry.def` (+1)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-3mm-range.ll` (new, +158)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-3mm-range-noop.ll` (new, +40)
+  - `clang/include/clang/Basic/LangOptions.def` (+1)
+  - `clang/include/clang/Driver/Options.td` (+3)
+  - `clang/lib/CodeGen/BackendUtil.cpp` (+10)
+  - `doc/COMMIT_HISTORY.md` (this entry)
+
+Fourth instance of the paired host-LLVM/device-MLIR launch-tile pattern, a direct clone of the 2mm local-tile pair (previous entry) applied to the baseline polybench 3mm benchmark. The benchmark launches THREE back-to-back GEMM kernels (`Polybench_3mm_1` `E += A*B`, `Polybench_3mm_2` `F += C*D`, `Polybench_3mm_3` `G += E*F` — all read_write, so all seeded from the existing output value), all sharing the GEMM shape `out[i,j] = seed(i,j) + sum_k in1[i,k]*in2[k,j]` and the captured-struct layout (i64 size_, OUT accessor, IN1 read, IN2 read); ONE instance of the device pass rewrites all three.
+
+**Device pass `sycl-3mm-local-tile`** (`ThreeMmLocalTilePass`, cgeist, off by default): identical 16×16 LDS-tile micro-kernel to 2mm (two private AS-3 `memref.global` 16×16 f32 tiles per kernel in the gpu.module — six globals total, `_3mm_k{1,2,3}_{a,b}Tile`; cooperative clamped staging loads, `rocdl.barrier` pair per k-chunk, scalar `scf.for` iter_arg accumulator, 16-FMA inner loop, predicated final store, select-zero k-tail built in from day one). The one structural addition over 2mm: **tile-name resolution walks up from the body to the enclosing `func` (via the `sycl.kernel_func_obj` anchor) or `gpu.func` (own name)** to derive the kernel index — with three kernels and an identical SeedMode (all SeedFromC), the seed alone no longer disambiguates which per-kernel LDS globals to reference, unlike 2mm's SeedFromC/ZeroSeed split. Both rewrite sites per kernel (wrapper lambda-body `func.func` + born-inlined direct `gpu.func @_ZTS15Polybench_3mm_{1,2,3}`) — six rewrites total.
+
+**Host pass `SYCLRewrite3mmRange`** (`-fsycl-rewrite-3mm-range`, PipelineStartEP, `SYCLIsHost`-gated): identical algorithm to the 2mm host pass with THREE kernel anchors (`_ZTS15Polybench_3mm_{1,2,3}` string constants + the matching `Polybench_3mm_N` fragments in the `parallel_for_lambda_impl` mangled names); rewrites every i64 store into each launch's `%UserRange`-derived alloca to the ceil16 pad `((V+15) udiv 16) * 16`.
+
+**Runtime**: zero new work — reuses 2mm's `SYCL_FORCE_LOCAL_SIZE=16,16` env hook (previous entry) to fix the (16,16) work-group shape on the padded launches.
+
+**Lit tests:** `3mm-local-tile.mlir` (positive amdgcn chunk → detection statistics; negative spir64 chunk; same documented asm-parser limitation on `memref<?x!llvm.struct<...>>` element types, full rewrite verified out-of-tree); `sycl-rewrite-3mm-range.ll` (positive; CHECKs the padded store rewrite on all three launch shapes) and `sycl-rewrite-3mm-range-noop.ll` (negative; CHECK-NOT `udiv` with no 3mm anchor). All pass; the 2mm siblings are unregressed.
+
+**Verification (gfx906, size 1024, job 21764864, 2026-08-27):** device ELF shows exactly 2 `s_barrier` + 14 LDS ops per kernel body across all 6 rewrite sites (12 `s_barrier` total; the 3mm_off baseline has 0). GPU: baseline 0.0221 s Verify PASS; local-tile 0.0047 s Verify PASS → **4.74× mean speedup (5.5× median), BEATS the source-level 3mm_opt (0.0056 s)**. N=1030 (N%16≠0) Verify PASS — the tail path (padded launch, partial tiles, per-cell predication, select-zero k-lanes) confirmed. Bench wiring (`sycl-bench` `THREE_MM_LAUNCH_TILE` CMake option, `build-ab-3mm.sh`, `3mm-launch-tile-verify.sbatch`) lives outside this repo and is not included.
+
+Sharp edges: same as 2mm — the win is paired + env-dependent (`-Xcgeist --sycl-3mm-local-tile -Xclang -fsycl-rewrite-3mm-range` + `SYCL_FORCE_LOCAL_SIZE=16,16` must all be active); the device pass alone is correctness-preserving but a silent no-op on the live path, and without the env var the padded launch gets auto `(L,1)` groups and produces garbage. Additionally the six LDS globals consume 6×2×16×16×4 B = 3 KB of static group memory — far under gfx906's 64 KB LDS limit, but a future larger-TS retune multiplies per-kernel consumption by kernel count.
+
+End-to-end effect: a 3mm benchmark compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-3mm-local-tile -Xclang -fsycl-rewrite-3mm-range` and run with `SYCL_FORCE_LOCAL_SIZE=16,16` now runs all three GEMM kernels as 16×16 LDS-tiled bodies on ceil16(N)×ceil16(N) padded grids, giving 4.74× on gfx906 at size 1024 with Verify PASS and beating the source-level 3mm_opt. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
+
+---

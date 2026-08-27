@@ -327,4 +327,75 @@ def TwoMmLocalTilePass
   ];
 }
 
+def ThreeMmLocalTilePass
+    : Pass<"sycl-3mm-local-tile", "::mlir::ModuleOp"> {
+  let summary = "Rewrite ALL THREE polybench 3mm kernels (Polybench_3mm_1 E += A*B, Polybench_3mm_2 F += C*D, Polybench_3mm_3 G += E*F, all read_write so all seeded from the existing output) to the 3mm_opt form: 16x16 LDS tiles cooperatively loaded by 16x16 work-groups (rocdl.barrier between stages), one output cell and a scalar accumulator per work-item; pair with the host LLVM pass SYCLRewrite3mmRange which pads ALL THREE launches to ceil16(N) x ceil16(N) and the runtime env SYCL_FORCE_LOCAL_SIZE=16,16 which fixes the work-group shape";
+  let description = [{
+    Device-side half of the 3MM optimization, transcribing the LDS-tiled
+    micro-kernel of the source-level polybench/orise/3mm_opt.cpp (a direct
+    sibling of the 2mm pass, which GPU-verified 4.61x over the baseline on
+    gfx906 and beat 2mm_opt; the earlier register-tile form of that family
+    measured 2.2x SLOWER and was replaced). ONE instance of this pass
+    rewrites ALL THREE 3mm kernels -- the benchmark launches three
+    back-to-back GEMMs sharing the shape out[i,j] = seed(i,j) +
+    sum_k in1[i,k]*in2[k,j] and the captured-struct layout (i64 size_, OUT
+    accessor, IN1 read, IN2 read); all three accumulate into a read_write
+    output (baseline bodies are `X[item] += ...`), so all three are seeded
+    from the existing OUT value (SeedFromC). Tile shape TS = TK = 16,
+    exactly 3mm_opt's: each 16x16 work-group (256 work-items)
+    cooperatively stages a 16x16 tile of A (rows) and B (columns) per
+    k-chunk -- ONE global load of each per work-item, coalesced -- then
+    every work-item runs a 16-FMA micro-kernel on the staged tiles into a
+    SCALAR accumulator (an scf.for iter_arg -- a register; no accumulator
+    memref anywhere) and stores its single output cell (cell = item id).
+    The two LDS tiles are private module-scope memref.globals with the
+    SYCL local address space (AS 3), created in the enclosing gpu.module
+    (same construction as LoopInternalization's WGLocalMem); phase-3
+    lowers them to internal addrspace(3) LLVM globals which the AMDGPU
+    backend allocates into static LDS (group_segment_fixed_size) -- no
+    kernel-signature or host-side plumbing. Barriers are rocdl.barrier ops
+    (the only barrier op that survives this pipeline: gpu.barrier is
+    explicitly illegal in phase 3 and spirv.ControlBarrier has no ROCDL
+    lowering); the ROCDL dialect is legal in the phase-3 target and its
+    LLVMIR translation produces fence(workgroup) +
+    llvm.amdgcn.s.barrier. The launch must provide 16x16 work-groups: the
+    paired HOST LLVM pass SYCLRewrite3mmRange (-fsycl-rewrite-3mm-range)
+    rewrites ALL THREE range<2> launches to (ceil16(N), ceil16(N)) -- the
+    FULL padded grid, one work-item per output CELL -- and the SYCL
+    runtime env var SYCL_FORCE_LOCAL_SIZE=16,16 (this tree) supplies the
+    explicit local size (neither auto local -- UR's
+    simpleGuessLocalWorkSize sizes only dim 0 -- nor reqd_work_group_size
+    -- UR HIP stubs COMPILE_WORK_GROUP_SIZE to {0,0,0} and the runtime
+    rejects 3-element reqd against a 2-D launch -- can provide it). With
+    local (16,16) guaranteed, all of 3mm_opt's index math reduces to
+    arithmetic on the item id: ty = irow % 16, tx = jcol % 16. Edge
+    handling for N % 16 != 0: the padded launch creates up to 15
+    out-of-range rows/cols of work-items; their loads are clamped
+    (min(idx, M-1)) and their final store is predicated (irow < M && jcol
+    < M); out-of-range TAIL K-LANES store 0.0 into the tile via a
+    branch-free select (clamping alone would double-count the last
+    row/column -- a latent bug in 3mm_opt itself). TWO rewrite sites are
+    needed per kernel because the cgeist frontend emits each body twice:
+    (1) the top-level lambda body func.func, called per enumerated user
+    item by the __pf_kernel_wrapper path (only runs when range rounding
+    fires, which ceil16 values never trigger -- ceil16(N) is a multiple of
+    the rounding MinFactor 16), and (2) the DIRECT kernels
+    gpu.func @_ZTS15Polybench_3mm_{1,2,3} whose bodies are born inlined
+    from the frontend (the path that always runs). Gated on (1)
+    --sycl-3mm-local-tile (off) and (2) llvm.target_triple ==
+    amdgcn-amd-amdhsa-syclmlir.
+  }];
+  let constructor = "mlir::sycl::createThreeMmLocalTilePass()";
+  let dependentDialects = ["arith::ArithDialect", "memref::MemRefDialect",
+                            "affine::AffineDialect", "gpu::GPUDialect",
+                            "scf::SCFDialect", "math::MathDialect",
+                            "func::FuncDialect", "ROCDL::ROCDLDialect"];
+  let statistics = [
+    Statistic<"NumDetected", "num-detected",
+              "Number of 3mm bodies detected">,
+    Statistic<"NumRewritten", "num-rewritten",
+              "Number of 3mm bodies rewritten to local-tile form">,
+  ];
+}
+
 #endif // MLIR_DIALECT_SYCL_TRANSFORMS_PASSES

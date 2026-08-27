@@ -8,6 +8,7 @@ add_mlir_library(MLIRSYCLTransforms
   SyrkRegisterTile.cpp
   Syr2kRegisterTile.cpp
   TwoMmLocalTile.cpp
+  ThreeMmLocalTile.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Transforms
