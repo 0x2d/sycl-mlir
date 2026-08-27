@@ -29,6 +29,7 @@
 #include <sycl/detail/kernel_desc.hpp>
 #include <sycl/sampler.hpp>
 
+#include <array>
 #include <cassert>
 #include <optional>
 #include <string>
@@ -2310,6 +2311,42 @@ void SetArgBasedOnType(
   }
 }
 
+/// If the SYCL_FORCE_LOCAL_SIZE env var is set and compatible with the
+/// launch, write the forced local size into \p ForcedLocal and return a
+/// pointer to it; otherwise return nullptr (the launch keeps its
+/// existing/auto local size). Compatibility rules keep unrelated kernels
+/// unaffected: only launches WITHOUT an explicit local size (plain range
+/// parallel_for -- never nd_range), whose every global dimension is
+/// divisible by the forced per-dim size and whose total does not exceed the
+/// device's max work-group size, are overridden. \p NDR must already have
+/// its dimensions reversed (PI order); the forced values are consumed in
+/// that same order.
+static size_t *getForcedLocalSize(const NDRDescT &NDR,
+                                  const device_impl &DeviceImpl,
+                                  size_t (&ForcedLocal)[3]) {
+  std::optional<std::array<size_t, 3>> Forced =
+      SYCLConfig<SYCL_FORCE_LOCAL_SIZE>::get();
+  if (!Forced)
+    return nullptr;
+
+  size_t Local[3] = {1, 1, 1};
+  size_t Total = 1;
+  for (size_t D = 0; D < NDR.Dims; ++D) {
+    Local[D] = (*Forced)[D];
+    Total *= Local[D];
+  }
+  if (Total > DeviceImpl.get_info<info::device::max_work_group_size>())
+    return nullptr;
+  for (size_t D = 0; D < NDR.Dims; ++D)
+    if (NDR.GlobalSize[D] % Local[D] != 0)
+      return nullptr;
+
+  ForcedLocal[0] = Local[0];
+  ForcedLocal[1] = Local[1];
+  ForcedLocal[2] = Local[2];
+  return ForcedLocal;
+}
+
 static pi_result SetKernelParamsAndLaunch(
     const QueueImplPtr &Queue, std::vector<ArgDesc> &Args,
     const std::shared_ptr<device_image_impl> &DeviceImageImpl,
@@ -2352,6 +2389,12 @@ static pi_result SetKernelParamsAndLaunch(
          RequiredWGSize[2] != 0);
     if (EnforcedLocalSize)
       LocalSize = RequiredWGSize;
+    else
+      // Range launch with no compile-time (reqd) size: let the
+      // SYCL_FORCE_LOCAL_SIZE env var override the auto local size when
+      // compatible (the UR HIP adapter's guess only sizes dim 0).
+      LocalSize = getForcedLocalSize(NDRDesc, *(Queue->getDeviceImplPtr()),
+                                     RequiredWGSize);
   }
   if (OutEventImpl != nullptr)
     OutEventImpl->setHostEnqueueTime();
@@ -2469,6 +2512,11 @@ pi_int32 enqueueImpCommandBufferKernel(
          RequiredWGSize[2] != 0);
     if (EnforcedLocalSize)
       LocalSize = RequiredWGSize;
+    else
+      // Range launch with no compile-time (reqd) size: let the
+      // SYCL_FORCE_LOCAL_SIZE env var override the auto local size when
+      // compatible (the UR HIP adapter's guess only sizes dim 0).
+      LocalSize = getForcedLocalSize(NDRDesc, *DeviceImpl, RequiredWGSize);
   }
 
   pi_result Res = Plugin->call_nocheck<

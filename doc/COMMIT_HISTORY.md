@@ -663,3 +663,48 @@ Two sharp edges carried over from SYRK, both still load-bearing: (1) the win is 
 End-to-end effect: a `Syr2k1` kernel compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-syr2k-register-tile -Xclang -fsycl-rewrite-syr2k-range` now runs an 8×8 register-tiled body (2 FMAs per cell per k) on a `ceil(N/8)×ceil(N/8)` launch, giving 1.47× on gfx906 at size 1024 with Verify PASS; results within the benchmark's 0.05 percentDiff threshold. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
 
 ---
+
+## [SYCL-MLIR] Add 2mm local-tile pass pair for AMDGCN (device LDS-tile + host launch pad + SYCL_FORCE_LOCAL_SIZE)
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-08-26
+- **Files:**
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.h` (+1)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.td` (+67)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CMakeLists.txt` (+2)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/TwoMmLocalTile.cpp` (new, +648)
+  - `mlir-sycl/test/Transforms/2mm-local-tile.mlir` (new, +114)
+  - `polygeist/tools/cgeist/Options.h` (+15)
+  - `polygeist/tools/cgeist/driver.cc` (+7)
+  - `llvm/include/llvm/SYCLLowerIR/SYCLRewrite2mmRange.h` (new, +69)
+  - `llvm/lib/SYCLLowerIR/SYCLRewrite2mmRange.cpp` (new, +226)
+  - `llvm/lib/SYCLLowerIR/CMakeLists.txt` (+1)
+  - `llvm/lib/Passes/PassBuilder.cpp` (+1)
+  - `llvm/lib/Passes/PassRegistry.def` (+1)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-2mm-range.ll` (new, +125)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-2mm-range-noop.ll` (new, +40)
+  - `clang/include/clang/Basic/LangOptions.def` (+1)
+  - `clang/include/clang/Driver/Options.td` (+3)
+  - `clang/lib/CodeGen/BackendUtil.cpp` (+10)
+  - `sycl/source/detail/config.def` (+1)
+  - `sycl/source/detail/config.hpp` (+58)
+  - `sycl/source/detail/scheduler/commands.cpp` (+48)
+  - `doc/COMMIT_HISTORY.md` (this entry)
+
+Third instance of the paired host-LLVM/device-MLIR launch-tile pattern (after SYRK and SYR2K), applied to the baseline polybench 2mm benchmark — but with a **different tile technology** and a **new runtime hook**: the earlier register-tile form of this pass (8×8 regC per item on a shrunk `ceil(N/8)` launch) was GPU-verified CORRECT but **2.2× SLOWER** than baseline (0.0328 vs 0.0148 s at N=1024) while the source-level `2mm_opt` (LDS-tiled) measured 4.6× FASTER (0.0032 s); the pass was replaced in place by the LDS design. The commit therefore contains three coordinated pieces:
+
+1. **Device MLIR pass `sycl-2mm-local-tile`** (`TwoMmLocalTilePass`, cgeist, off by default): a faithful MLIR transcription of `2mm_opt`'s `submitTiledGemm`. TS = TK = 16. Each 16×16 work-group (256 work-items) cooperatively stages a 16×16 tile of A (rows) and B (columns) into two private module-scope `memref.global` 16×16 f32 tiles in the SYCL local address space (AS 3, same construction as LoopInternalization's WGLocalMem; per-kernel names `_2mm_k{1,2}_{a,b}Tile`) — ONE coalesced global load of each per work-item per k-chunk — then every work-item runs a 16-FMA micro-kernel on the staged tiles into a SCALAR accumulator (an `scf.for` iter_arg — a register; NO accumulator memref anywhere) and stores its single output cell (cell = item id). ONE instance rewrites BOTH benchmark kernels (`Polybench_2mm_1` `C += A*B` seeded from the existing read_write C; `Polybench_2mm_2` `E = C*D` discard_write seeded from zero) at BOTH rewrite sites — the wrapper-path lambda-body `func.func` and the born-inlined direct `gpu.func @_ZTS15Polybench_2mm_{1,2}` (the path that always runs; lesson from SYRK's `_ZTS6Syr2k2`). Edge handling for N%16≠0: loads clamped (`min(idx, M-1)`), final store predicated (`irow < M && jcol < M`), and out-of-range TAIL K-LANES store 0.0 into the tile via a branch-free `arith.select` (clamping alone would double-count the last k row/column — a latent bug in `2mm_opt` itself, exposed by this pass's N=1030 verify round 1 and fixed here).
+2. **Host LLVM pass `SYCLRewrite2mmRange`** (`-fsycl-rewrite-2mm-range`, PipelineStartEP, `SYCLIsHost`-gated): anchors on the private string constant from `__builtin_sycl_unique_stable_name(Polybench_2mm_N)`; finds each 2-D `getRoundedRangeILi2EE` call whose two i64 range args load from a common alloca; traces a filling memcpy back to the origin `%UserRange` alloca when needed; rewrites every i64 store into that alloca to `((V+15) udiv 16) * 16` — the FULL PADDED grid, one work-item per output CELL (not the old ceil(N/8) shrink). Divisibility by 16 satisfies the UR launch validator for the explicit local size, and ceil16 values never trigger range rounding (multiples of the rounding MinFactor 16), so the direct-kernel path is the one that runs.
+3. **Runtime env `SYCL_FORCE_LOCAL_SIZE=16,16`** (new in this tree, first of the family): `SYCLConfig<SYCL_FORCE_LOCAL_SIZE>` parse-once support in `config.hpp` (per-dim "a,b,c", trailing dims default 1, nullopt on unset/malformed/zero) + a `getForcedLocalSize()` helper in `scheduler/commands.cpp` applied at BOTH enqueue sites (regular `SetKernelParamsAndLaunch` and the command-buffer path) in the `else` branch after `COMPILE_WORK_GROUP_SIZE` enforcement. Compatibility rules keep unrelated kernels unaffected: only launches WITHOUT an explicit local size (plain range `parallel_for`, never `nd_range`), whose every global dimension is divisible by the forced per-dim size, and whose total does not exceed the device's max work-group size, are overridden. NECESSARY because the UR HIP adapter's `simpleGuessLocalWorkSize` sizes only dim 0 (auto local is `(L,1)`), `UR_KERNEL_GROUP_INFO_COMPILE_WORK_GROUP_SIZE` is stubbed to `{0,0,0}` so `reqd_work_group_size` can never be enforced, and `program_manager.cpp` rejects a 3-element reqd against a 2-D launch anyway.
+
+**Barrier op: `rocdl.barrier`** — the only barrier that survives this pipeline: no sycl.barrier op exists; `gpu.barrier` is explicitly illegal in ConvertPolygeistToLLVM; `spirv.ControlBarrier` has no ROCDL lowering. The ROCDL dialect is legal in the phase-3 target and its LLVMIR translation emits `fence(workgroup)` + `llvm.amdgcn.s.barrier`. This is why `MLIRROCDLDialect` joins the Transforms CMake LINK_LIBS and the pass declares a ROCDL dependent dialect.
+
+**Lit tests:** `2mm-local-tile.mlir` (positive amdgcn chunk with `memref<?xi64>` stand-in arg0 → `num-detected` statistics; negative spir64 chunk; the asm parser's `memref<?x!llvm.struct<...>>` rejection is documented in-file — the full rewrite is verified via the cgeist IR dump and the GPU run); `sycl-rewrite-2mm-range.ll` (positive; CHECKs the `+15 udiv 16 * 16` padded store rewrite on the real memcpy'd PipelineStartEP shape) and `sycl-rewrite-2mm-range-noop.ll` (negative; CHECK-NOT `udiv` with no 2mm anchor). All three pass.
+
+**Verification (gfx906, size 1024, DTK 25.04.x runtime, job 21762797):** device ELF (2-step unbundle of the nested hipv4-amdgcn bundle) shows 8 `s_barrier` (2 per k-body × 4 rewrite sites) and 56 `ds_read`/`ds_write`; `_ZTS15Polybench_2mm_1` alone carries exactly 2 `s_barrier` + 14 LDS ops. GPU: baseline 0.0153 s Verify PASS; local-tile 0.0033 s Verify PASS → **4.61× speedup, BEATS the source-level 2mm_opt (0.0037 s)**. N=1030 (N%16≠0) 0.0055 s Verify PASS — the tail-chunk select-zero fix confirmed (round 1 at N=1030 FAILed on the clamp double-count). Verify PASS is itself proof the forced (16,16) local took effect (wrong work-group shape ⇒ garbage tiles ⇒ FAIL). Bench wiring (`sycl-bench` `TWO_MM_LAUNCH_TILE` CMake option + per-target flags, sbatch exporting `SYCL_FORCE_LOCAL_SIZE=16,16` and `SYCL_DISABLE_PARALLEL_FOR_RANGE_ROUNDING=1`) lives outside this repo and is not included.
+
+Sharp edges: (1) the win is **paired + env-dependent** — all three pieces must be enabled together (`-Xcgeist --sycl-2mm-local-tile -Xclang -fsycl-rewrite-2mm-range` + `SYCL_FORCE_LOCAL_SIZE=16,16`); the device pass alone is correctness-preserving but a silent no-op, and without the env var the padded launch gets auto `(L,1)` groups and produces garbage. (2) The env var is process-global: any concurrently-run range-launch kernel whose global dims happen to be divisible by 16×16 and within the WG limit would also be forced — benign for the benchmark suites run under it, but a reason to keep it out of default environments. (3) The scalar-accumulator-as-iter_arg shape is what keeps the accumulator in a register; reintroducing an accumulator memref regresses to the scratch-memory pathology.
+
+End-to-end effect: a 2mm benchmark compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-2mm-local-tile -Xclang -fsycl-rewrite-2mm-range` and run with `SYCL_FORCE_LOCAL_SIZE=16,16` now runs both GEMM kernels as 16×16 LDS-tiled bodies on the ceil16(N)×ceil16(N) padded grid, giving 4.61× on gfx906 at size 1024 with Verify PASS and beating the source-level 2mm_opt. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
+
+---

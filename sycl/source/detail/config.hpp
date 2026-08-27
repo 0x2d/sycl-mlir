@@ -20,6 +20,7 @@
 #include <array>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -235,6 +236,63 @@ public:
 // ONEAPI_DEVICE_SELECTOR
 const std::array<std::pair<std::string, info::device_type>, 6> &
 getSyclDeviceTypeMap();
+
+// ---------------------------------------
+// SYCL_FORCE_LOCAL_SIZE support
+// Overrides the auto local size of range (non-nd_range) kernel launches with
+// an explicit per-dimension local size, e.g. "16,16" for the LDS-tiled 2mm
+// kernel pair (see scheduler/commands.cpp). Applies only when compatible
+// (launch dims divisible, within device limits); never overrides an
+// nd_range's explicit local size.
+template <> class SYCLConfig<SYCL_FORCE_LOCAL_SIZE> {
+  using BaseT = SYCLConfigBase<SYCL_FORCE_LOCAL_SIZE>;
+
+public:
+  /// Returns the parsed per-dimension local size ("a,b,c"; trailing dims
+  /// default to 1 -- "16,16" == "16,16,1"), or std::nullopt when unset or
+  /// malformed. Parsed at most once.
+  static std::optional<std::array<size_t, 3>> get() {
+    static std::optional<std::array<size_t, 3>> Value = parse();
+    return Value;
+  }
+
+  static void reset() {
+    // Nothing to do: the parse-once cache intentionally follows the
+    // process-lifetime env var (same semantics as the other parse-once
+    // configs).
+  }
+
+private:
+  static std::optional<std::array<size_t, 3>> parse() {
+    const char *ValStr = BaseT::getRawValue();
+    if (ValStr == nullptr)
+      return std::nullopt;
+    std::array<size_t, 3> Local{1, 1, 1};
+    std::string Str(ValStr);
+    size_t Pos = 0;
+    for (int Dim = 0; Dim < 3; ++Dim) {
+      size_t Next = Str.find(',', Pos);
+      std::string Token =
+          Str.substr(Pos, Next == std::string::npos ? std::string::npos
+                                                    : Next - Pos);
+      if (Token.empty())
+        return std::nullopt;
+      unsigned long long V = 0;
+      try {
+        V = std::stoull(Token);
+      } catch (...) {
+        return std::nullopt;
+      }
+      if (V == 0)
+        return std::nullopt;
+      Local[Dim] = static_cast<size_t>(V);
+      if (Next == std::string::npos)
+        break;
+      Pos = Next + 1;
+    }
+    return Local;
+  }
+};
 
 // Array is used by SYCL_DEVICE_FILTER and SYCL_DEVICE_ALLOWLIST and
 // ONEAPI_DEVICE_SELECTOR

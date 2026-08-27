@@ -7,6 +7,7 @@ add_mlir_library(MLIRSYCLTransforms
   SyrkRegisterAccumulator.cpp
   SyrkRegisterTile.cpp
   Syr2kRegisterTile.cpp
+  TwoMmLocalTile.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Transforms
@@ -22,4 +23,5 @@ add_mlir_library(MLIRSYCLTransforms
   MLIRSYCLDialect
   MLIRFuncDialect
   MLIRGPUDialect
+  MLIRROCDLDialect
   )

@@ -197,6 +197,21 @@ static llvm::cl::opt<bool> EnableSyr2kRegisterTile(
                    "correct if the host pass does not fire. "
                    "amdgcn-amd-amdhsa-syclmlir target only"));
 
+static llvm::cl::opt<bool> EnableTwoMmLocalTile(
+    "sycl-2mm-local-tile", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite BOTH polybench 2mm kernels to the 2mm_opt "
+                   "LDS-tiled form: 16x16 work-groups cooperatively stage "
+                   "16x16 A/B tiles in local memory (rocdl.barrier between "
+                   "stages), one output cell and a scalar accumulator per "
+                   "work-item. Kernel 1 (C += A*B, read_write) is seeded "
+                   "from the existing C; kernel 2 (E = C*D, discard_write) "
+                   "is seeded from zero. Pair with the host LLVM pass "
+                   "SYCLRewrite2mmRange (-fsycl-rewrite-2mm-range), which "
+                   "pads BOTH launches to ceil16(N) x ceil16(N), and the "
+                   "runtime env SYCL_FORCE_LOCAL_SIZE=16,16 which fixes the "
+                   "work-group shape. amdgcn-amd-amdhsa-syclmlir target "
+                   "only"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

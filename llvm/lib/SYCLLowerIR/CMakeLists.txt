@@ -68,6 +68,7 @@ add_llvm_component_library(LLVMSYCLLowerIR
   SYCLPropagateJointMatrixUsage.cpp
   SYCLRewriteSyrkRange.cpp
   SYCLRewriteSyr2kRange.cpp
+  SYCLRewrite2mmRange.cpp
   SYCLUtils.cpp
 
   LocalAccessorToSharedMemory.cpp

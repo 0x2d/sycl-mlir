@@ -41,6 +41,7 @@ std::unique_ptr<Pass> createCovarianceLoopReorderPass();
 std::unique_ptr<Pass> createSyrkRegisterAccumulatorPass();
 std::unique_ptr<Pass> createSyrkRegisterTilePass();
 std::unique_ptr<Pass> createSyr2kRegisterTilePass();
+std::unique_ptr<Pass> createTwoMmLocalTilePass();
 
 //===----------------------------------------------------------------------===//
 // Registration
