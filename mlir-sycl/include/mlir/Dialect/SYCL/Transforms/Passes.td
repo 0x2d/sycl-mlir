@@ -398,4 +398,69 @@ def ThreeMmLocalTilePass
   ];
 }
 
+def GemmLocalTilePass
+    : Pass<"sycl-gemm-local-tile", "::mlir::ModuleOp"> {
+  let summary = "Rewrite the polybench gemm kernel (Gemm: C = ALPHA*A*B + BETA*C) to the gemm_opt form: 16x16 LDS tiles cooperatively loaded by 16x16 work-groups (rocdl.barrier between stages), one output cell and a scalar accumulator per work-item seeded from C*BETA with ALPHA-scaled FMAs; pair with the host LLVM pass SYCLRewriteGemmRange which pads the launch to ceil16(N) x ceil16(N) and the runtime env SYCL_FORCE_LOCAL_SIZE=16,16 which fixes the work-group shape";
+  let description = [{
+    Device-side half of the GEMM optimization, transcribing the LDS-tiled
+    micro-kernel of the source-level polybench/orise/gemm_opt.cpp (a direct
+    sibling of TwoMmLocalTile, which GPU-verified 4.61x over the baseline
+    on gfx906 and BEAT 2mm_opt; the earlier register-tile form of that
+    family measured 2.2x SLOWER and was replaced). This pass rewrites the
+    ONE gemm kernel (`Gemm`: C = ALPHA*A*B + BETA*C, C read_write, A/B
+    read); it shares the 2mm/3mm GEMM shape and captured-struct layout
+    (i64 NK_, OUT accessor, IN1 read, IN2 read) and differs only in the
+    seed (existing C scaled by BETA) and the ALPHA-scaled FMA. Tile shape
+    TS = TK = 16, exactly gemm_opt's: each 16x16 work-group (256
+    work-items) cooperatively stages a 16x16 tile of A (rows) and B
+    (columns) per k-chunk -- ONE global load of each per work-item,
+    coalesced -- then every work-item runs a 16-FMA micro-kernel on the
+    staged tiles into a SCALAR accumulator (an scf.for iter_arg -- a
+    register; no accumulator memref anywhere) seeded from C*BETA and
+    stores its single output cell (cell = item id). The two LDS tiles are
+    private module-scope memref.globals with the SYCL local address space
+    (AS 3), created in the enclosing gpu.module (same construction as
+    LoopInternalization's WGLocalMem); phase-3 lowers them to internal
+    addrspace(3) LLVM globals which the AMDGPU backend allocates into
+    static LDS (group_segment_fixed_size) -- no kernel-signature or
+    host-side plumbing (and no local accessor, sidestepping the
+    2-local-accessor miscompilation). Barriers are rocdl.barrier ops (the
+    only barrier op that survives this pipeline: gpu.barrier is explicitly
+    illegal in phase 3 and spirv.ControlBarrier has no ROCDL lowering).
+    The launch must provide 16x16 work-groups: the paired HOST LLVM pass
+    SYCLRewriteGemmRange (-fsycl-rewrite-gemm-range) rewrites the range<2>
+    launch to (ceil16(N), ceil16(N)) -- the FULL padded grid, one work-item
+    per output CELL -- and the SYCL runtime env var
+    SYCL_FORCE_LOCAL_SIZE=16,16 (this tree) supplies the explicit local
+    size. Edge handling for N % 16 != 0: the padded launch creates up to
+    15 out-of-range rows/cols of work-items; their loads are clamped
+    (min(idx, M-1)) and their final store is predicated (irow < M && jcol
+    < M). Tail k-lanes (kt+tx >= M) zero-fill the tile (branch-free
+    select) instead of clamping, which would double-count the last k
+    row/column -- a latent bug in gemm_opt itself (the same issue 2mm's
+    round-1 GPU verify exposed at N=1030). TWO rewrite sites are needed
+    because the cgeist frontend emits the body twice: (1) the top-level
+    lambda body func.func, called per enumerated user item by the
+    __pf_kernel_wrapper path (only runs when range rounding fires, which
+    ceil16 values never trigger), and (2) the DIRECT kernel
+    gpu.func @_ZTS4Gemm whose body is born inlined from the frontend (the
+    path that always runs). Detection anchors are EXACT matches on
+    `_ZTS4Gemm` -- bare "Gemm" is a substring of gemm_opt's
+    `_ZTS16Polybench_Gemm1` and must never match. Gated on (1)
+    --sycl-gemm-local-tile (off) and (2) llvm.target_triple ==
+    amdgcn-amd-amdhsa-syclmlir.
+  }];
+  let constructor = "mlir::sycl::createGemmLocalTilePass()";
+  let dependentDialects = ["arith::ArithDialect", "memref::MemRefDialect",
+                            "affine::AffineDialect", "gpu::GPUDialect",
+                            "scf::SCFDialect", "math::MathDialect",
+                            "func::FuncDialect", "ROCDL::ROCDLDialect"];
+  let statistics = [
+    Statistic<"NumDetected", "num-detected",
+              "Number of gemm bodies detected">,
+    Statistic<"NumRewritten", "num-rewritten",
+              "Number of gemm bodies rewritten to local-tile form">,
+  ];
+}
+
 #endif // MLIR_DIALECT_SYCL_TRANSFORMS_PASSES

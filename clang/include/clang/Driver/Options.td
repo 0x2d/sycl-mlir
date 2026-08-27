@@ -8135,6 +8135,9 @@ def fsycl_rewrite_2mm_range : Flag<["-"], "fsycl-rewrite-2mm-range">,
 def fsycl_rewrite_3mm_range : Flag<["-"], "fsycl-rewrite-3mm-range">,
   HelpText<"Rewrite ALL THREE 3mm parallel_for launch ranges to ceil16(N) per dim (local-tile co-optimization).">,
   MarshallingInfoFlag<LangOpts<"SYCLRewrite3mmRange">>;
+def fsycl_rewrite_gemm_range : Flag<["-"], "fsycl-rewrite-gemm-range">,
+  HelpText<"Rewrite the gemm parallel_for launch range to ceil16(N) per dim (local-tile co-optimization).">,
+  MarshallingInfoFlag<LangOpts<"SYCLRewriteGemmRange">>;
 def fsycl_enable_int_header_diags: Flag<["-"], "fsycl-enable-int-header-diags">,
   HelpText<"Enable diagnostics that require the SYCL integration header.">,
   MarshallingInfoFlag<LangOpts<"SYCLEnableIntHeaderDiags">>;

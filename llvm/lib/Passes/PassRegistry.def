@@ -158,6 +158,7 @@ MODULE_PASS("sycl-rewrite-syrk-range", SYCLRewriteSyrkRangePass())
 MODULE_PASS("sycl-rewrite-syr2k-range", SYCLRewriteSyr2kRangePass())
 MODULE_PASS("sycl-rewrite-2mm-range", SYCLRewrite2mmRangePass())
 MODULE_PASS("sycl-rewrite-3mm-range", SYCLRewrite3mmRangePass())
+MODULE_PASS("sycl-rewrite-gemm-range", SYCLRewriteGemmRangePass())
 MODULE_PASS("compile-time-properties", CompileTimePropertiesPass())
 MODULE_PASS("cleanup-sycl-metadata", CleanupSYCLMetadataPass())
 #undef MODULE_PASS

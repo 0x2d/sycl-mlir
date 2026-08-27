@@ -553,6 +553,11 @@ static LogicalResult optimize(mlir::MLIRContext &Ctx,
       PM.addPass(mlir::createCSEPass());
     }
 
+    if (EnableGemmLocalTile) {
+      PM.addPass(sycl::createGemmLocalTilePass());
+      PM.addPass(mlir::createCanonicalizerPass(CanonicalizerConfig, {}, {}));
+      PM.addPass(mlir::createCSEPass());
+    }
   }
  
   if (PrintPipeline) {

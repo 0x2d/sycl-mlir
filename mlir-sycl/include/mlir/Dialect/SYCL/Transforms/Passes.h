@@ -43,6 +43,7 @@ std::unique_ptr<Pass> createSyrkRegisterTilePass();
 std::unique_ptr<Pass> createSyr2kRegisterTilePass();
 std::unique_ptr<Pass> createTwoMmLocalTilePass();
 std::unique_ptr<Pass> createThreeMmLocalTilePass();
+std::unique_ptr<Pass> createGemmLocalTilePass();
 
 //===----------------------------------------------------------------------===//
 // Registration

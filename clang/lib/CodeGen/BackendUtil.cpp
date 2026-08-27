@@ -60,6 +60,7 @@
 #include "llvm/SYCLLowerIR/SYCLRewriteSyr2kRange.h"
 #include "llvm/SYCLLowerIR/SYCLRewrite2mmRange.h"
 #include "llvm/SYCLLowerIR/SYCLRewrite3mmRange.h"
+#include "llvm/SYCLLowerIR/SYCLRewriteGemmRange.h"
 #include "llvm/Support/BuryPointer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -1003,6 +1004,15 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       PB.registerPipelineStartEPCallback(
           [&](ModulePassManager &MPM, OptimizationLevel Level) {
             MPM.addPass(SYCLRewrite3mmRangePass());
+          });
+
+    // Host-side launch-range rewrite for the gemm benchmark kernel,
+    // paired with the device-side MLIR pass `sycl-gemm-local-tile` (cgeist).
+    // Runs at PipelineStartEP for the same reason as the syrk hook above.
+    if (LangOpts.SYCLIsHost && LangOpts.SYCLRewriteGemmRange)
+      PB.registerPipelineStartEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level) {
+            MPM.addPass(SYCLRewriteGemmRangePass());
           });
 
     // Add the InferAddressSpaces pass for all the SPIR[V] targets

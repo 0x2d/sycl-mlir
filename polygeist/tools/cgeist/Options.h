@@ -227,6 +227,20 @@ static llvm::cl::opt<bool> EnableThreeMmLocalTile(
                    "the work-group shape. amdgcn-amd-amdhsa-syclmlir target "
                    "only"));
 
+static llvm::cl::opt<bool> EnableGemmLocalTile(
+    "sycl-gemm-local-tile", llvm::cl::init(false),
+    llvm::cl::desc("Rewrite the polybench gemm kernel (Gemm: "
+                   "C = ALPHA*A*B + BETA*C) to the gemm_opt LDS-tiled form: "
+                   "16x16 work-groups cooperatively stage 16x16 A/B tiles "
+                   "in local memory (rocdl.barrier between stages), one "
+                   "output cell and a scalar accumulator per work-item "
+                   "seeded from C*BETA with ALPHA-scaled FMAs. Pair with "
+                   "the host LLVM pass SYCLRewriteGemmRange "
+                   "(-fsycl-rewrite-gemm-range), which pads the launch to "
+                   "ceil16(N) x ceil16(N), and the runtime env "
+                   "SYCL_FORCE_LOCAL_SIZE=16,16 which fixes the work-group "
+                   "shape. amdgcn-amd-amdhsa-syclmlir target only"));
+
 static llvm::cl::opt<std::string> Standard("std", llvm::cl::init(""),
                                            llvm::cl::desc("C/C++ std"));
 

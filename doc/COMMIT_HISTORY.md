@@ -750,3 +750,47 @@ Sharp edges: same as 2mm — the win is paired + env-dependent (`-Xcgeist --sycl
 End-to-end effect: a 3mm benchmark compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-3mm-local-tile -Xclang -fsycl-rewrite-3mm-range` and run with `SYCL_FORCE_LOCAL_SIZE=16,16` now runs all three GEMM kernels as 16×16 LDS-tiled bodies on ceil16(N)×ceil16(N) padded grids, giving 4.74× on gfx906 at size 1024 with Verify PASS and beating the source-level 3mm_opt. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
 
 ---
+
+## [SYCL-MLIR] Add gemm local-tile pass pair for AMDGCN (device LDS-tile + host launch pad)
+
+- **Author:** Yucheng Ouyang
+- **Date:** 2026-08-27
+- **Files:**
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.h` (+1)
+  - `mlir-sycl/include/mlir/Dialect/SYCL/Transforms/Passes.td` (+65)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/CMakeLists.txt` (+1)
+  - `mlir-sycl/lib/Dialect/SYCL/Transforms/GemmLocalTile.cpp` (new, +647)
+  - `mlir-sycl/test/Transforms/gemm-local-tile.mlir` (new, +119)
+  - `polygeist/tools/cgeist/Options.h` (+14)
+  - `polygeist/tools/cgeist/driver.cc` (+5)
+  - `llvm/include/llvm/SYCLLowerIR/SYCLRewriteGemmRange.h` (new, +69)
+  - `llvm/lib/SYCLLowerIR/SYCLRewriteGemmRange.cpp` (new, +223)
+  - `llvm/lib/SYCLLowerIR/CMakeLists.txt` (+1)
+  - `llvm/lib/Passes/PassBuilder.cpp` (+1)
+  - `llvm/lib/Passes/PassRegistry.def` (+1)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-gemm-range.ll` (new, +96)
+  - `llvm/test/SYCLLowerIR/sycl-rewrite-gemm-range-noop.ll` (new, +39)
+  - `clang/include/clang/Basic/LangOptions.def` (+1)
+  - `clang/include/clang/Driver/Options.td` (+3)
+  - `clang/lib/CodeGen/BackendUtil.cpp` (+10)
+  - `doc/COMMIT_HISTORY.md` (this entry)
+
+Fifth and final instance of the paired host-LLVM/device-MLIR launch-tile pattern, a clone of the 2mm/3mm local-tile pairs (previous two entries) applied to the baseline polybench gemm benchmark (`Gemm`: `C = ALPHA*A*B + BETA*C`, C read_write, A/B read; ALPHA=32412, BETA=2123 in the benchmark source). Shares the GEMM shape and captured-struct layout (i64 NK_, OUT accessor, IN1 read, IN2 read) with 2mm/3mm and differs only in the seed and the FMA scaling — three deltas from TwoMmLocalTile:
+
+1. **Single kernel, exact-match anchors.** The pass rewrites the ONE `Gemm` kernel, and BOTH detection anchors are EXACT equality matches (`gpu.func @_ZTS4Gemm`, host string `_ZTS4Gemm`, lambda-impl fragment `I4Gemm`): bare "Gemm" is a substring of gemm_opt's `_ZTS16Polybench_Gemm1` and must never match — the lit suite includes a dedicated non-match chunk for it. The host pass is likewise the single-launch simplification of SYCLRewrite3mmRange.
+2. **Seed = `C[irow,jcol] * BETA`** (existing output scaled) instead of 2mm's raw-SeedFromC/zero split.
+3. **ALPHA-scaled FMA**: `fma(a*b, ALPHA, acc)` — the product multiplied out with ALPHA riding the addend, one FMA per k-lane like the baseline body (not `alpha * fma(a,b,acc)`).
+
+Everything else transfers verbatim: TS = TK = 16; two private AS-3 `memref.global` 16×16 f32 LDS tiles (`_gemm_{a,b}Tile`, shared by both rewrite sites — same kernel); cooperative clamped staging loads; `rocdl.barrier` pair per k-chunk; scalar `scf.for` iter_arg accumulator; 16-FMA inner loop; predicated final store; select-zero k-tail (`arith.select(ktTx < M, loaded, 0.0)`) — which, notably, fixes a latent clamp double-count bug that `gemm_opt` itself still carries (the same issue 2mm's round-1 GPU verify exposed at N=1030); both rewrite sites (wrapper lambda-body `func.func` + born-inlined direct `gpu.func @_ZTS4Gemm`); both gates (opt-in cgeist flag `--sycl-gemm-local-tile`, off by default, + `llvm.target_triple == amdgcn-amd-amdhsa-syclmlir`). No local accessor is used — the LDS tiles are module-scope globals, sidestepping the ≥2-local-accessor miscompilation. **Runtime**: zero new work — reuses `SYCL_FORCE_LOCAL_SIZE=16,16` (2mm entry).
+
+**Host pass `SYCLRewriteGemmRange`** (`-fsycl-rewrite-gemm-range`, PipelineStartEP, `SYCLIsHost`-gated): anchors on the `_ZTS4Gemm` string constant and the `I4Gemm` fragment; rewrites the launch's `%UserRange`-alloca i64 stores to the ceil16 pad `((V+15) udiv 16) * 16`.
+
+**Lit tests:** `gemm-local-tile.mlir` (positive amdgcn chunk → detection statistics; negative spir64 chunk; the `_ZTS16Polybench_Gemm1` exact-anchor non-match chunk; same documented asm-parser limitation); `sycl-rewrite-gemm-range.ll` (positive; CHECKs the padded store rewrite) and `sycl-rewrite-gemm-range-noop.ll` (negative; CHECK-NOT `udiv` with no anchor). All pass.
+
+**Verification (gfx906, job 21770153, 2026-08-27):** verification ladder all green — cgeist IR dump confirms both rewrite sites (seed `mulf C, BETA`, FMA `fma(a*b, ALPHA, acc)`, select-zero, 4 `rocdl.barrier`); device ELF `_ZTS4Gemm` = 2 `s_barrier` + 14 `ds_read`/`ds_write` + 16 `v_fmac_f32` (baseline: 0/0/5). GPU: baseline median 0.007614 s Verify PASS; local-tile median 0.001707 s Verify PASS → **4.46× median speedup, BEATS the source-level gemm_opt by ~9%** (0.001707 vs 0.001864 s median; means are outlier-skewed bimodal, median is the honest number). N=1030 AND N=520 (both N%16≠0) Verify PASS — the select-zero k-tail correct where gemm_opt's clamp-only form would double-count. Bench wiring (`sycl-bench` `GEMM_LAUNCH_TILE` CMake option, A/B build + GPU-verify sbatch) lives outside this repo and is not included.
+
+Sharp edges: same as 2mm/3mm — paired + env-dependent (`-Xcgeist --sycl-gemm-local-tile -Xclang -fsycl-rewrite-gemm-range` + `SYCL_FORCE_LOCAL_SIZE=16,16`); the device pass alone is a correctness-preserving silent no-op on the live path; without the env var the padded launch gets auto `(L,1)` groups and produces garbage. One gemm-specific note: because the ALPHA/BETA scalars ride the seed and FMA addends, a future benchmark variant with runtime (non-constexpr) ALPHA/BETA would need them loaded from the captured struct rather than folded as constants — the pass currently assumes the constexpr form.
+
+End-to-end effect: a gemm benchmark compiled with `-fsycl-targets=amdgcn-amd-amdhsa-syclmlir -Xcgeist --sycl-gemm-local-tile -Xclang -fsycl-rewrite-gemm-range` and run with `SYCL_FORCE_LOCAL_SIZE=16,16` now runs the kernel as a 16×16 LDS-tiled body on the ceil16(N)×ceil16(N) padded grid, giving 4.46× on gfx906 at size 1024 with Verify PASS and beating the source-level gemm_opt by ~9%. Off by default; the SPIR64 path and the baseline AMDGCN build are byte-identical to before.
+
+---
